@@ -2,9 +2,8 @@
 let currentInterface = "lifi";
 let lastBytes = 0;
 let lastTime = Date.now();
-let streamPollTimer = null;
 let currentStreamName = null;
-let lastStreamTimeRequest = -1;
+let hlsPlayer = null;
 
 // DOM refs
 const dotIface = document.getElementById("dot-interface");
@@ -115,8 +114,6 @@ async function refreshFiles() {
 document.getElementById("btn-refresh").addEventListener("click", refreshFiles);
 const videoPlayer = document.getElementById("video-player");
 videoPlayer.addEventListener("ended", closeModal);
-videoPlayer.addEventListener("seeking", () => requestStreamTime(true));
-videoPlayer.addEventListener("timeupdate", () => requestStreamTime(false));
 
 window.addEventListener("beforeunload", () => {
     if (!currentStreamName) return;
@@ -136,30 +133,17 @@ async function requestFile(name, ext) {
     }
 }
 
-function requestStreamTime(force) {
-    if (!currentStreamName) return;
-    const player = document.getElementById("video-player");
-    if (!Number.isFinite(player.currentTime)) return;
-    if (!force && Math.abs(player.currentTime - lastStreamTimeRequest) < 5) return;
-    lastStreamTimeRequest = player.currentTime;
-
-    fetch(`/api/stream/time/${encodeURIComponent(currentStreamName)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ time: player.currentTime, seconds: 20 }),
-    }).catch(() => {});
-}
-
 async function startVideoStream(name) {
     openVideoModal(name);
-    setVideoStatus("Starting stream...");
+    setVideoStatus("Preparing HLS playlist...");
 
     try {
         const r = await fetch(`/api/stream/start/${encodeURIComponent(name)}`, { method: "POST" });
         if (!r.ok) throw new Error("Stream start failed");
         const status = await r.json();
-        updateVideoBuffer(status);
-        waitForVideoBuffer(name);
+        if (!status.playlist_url) throw new Error("Missing playlist URL");
+        setVideoStatus("Playlist ready. Starting playback...");
+        playHls(status.playlist_url);
     } catch (e) {
         console.error("Stream failed:", e);
         setVideoStatus("Could not start stream.");
@@ -170,10 +154,11 @@ function openVideoModal(name) {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
     const title = document.getElementById("video-title");
-    clearInterval(streamPollTimer);
-    streamPollTimer = null;
+    if (hlsPlayer) {
+        hlsPlayer.destroy();
+        hlsPlayer = null;
+    }
     currentStreamName = name;
-    lastStreamTimeRequest = -1;
     player.pause();
     player.removeAttribute("src");
     player.load();
@@ -187,54 +172,46 @@ function setVideoStatus(text) {
     status.classList.remove("hidden");
 }
 
-function updateVideoBuffer(status) {
-    if (status.ready) {
-        setVideoStatus("Buffer ready. Starting playback...");
+function playHls(playlistUrl) {
+    const player = document.getElementById("video-player");
+    if (window.Hls && window.Hls.isSupported()) {
+        hlsPlayer = new Hls({
+            lowLatencyMode: false,
+            backBufferLength: 30,
+        });
+        hlsPlayer.loadSource(playlistUrl);
+        hlsPlayer.attachMedia(player);
+        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+            player.play().catch(() => {});
+            document.getElementById("video-status").classList.add("hidden");
+        });
+        hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) setVideoStatus("Playback error. Try reopening the stream.");
+        });
         return;
     }
 
-    const have = status.contiguous_chunks || 0;
-    const need = status.start_chunks || 0;
-    const bytes = formatBytes(status.available_bytes || 0);
-    const iface = (status.interface || currentInterface).toUpperCase();
-    setVideoStatus(`Buffering ${have}/${need} chunks (${bytes}) via ${iface}`);
-}
+    if (player.canPlayType("application/vnd.apple.mpegurl")) {
+        player.src = playlistUrl;
+        player.load();
+        player.play().catch(() => {});
+        document.getElementById("video-status").classList.add("hidden");
+        return;
+    }
 
-function waitForVideoBuffer(name) {
-    clearInterval(streamPollTimer);
-    streamPollTimer = setInterval(async () => {
-        try {
-            const r = await fetch(`/api/stream/status/${encodeURIComponent(name)}`);
-            const status = await r.json();
-            updateVideoBuffer(status);
-
-            if (status.ready) {
-                clearInterval(streamPollTimer);
-                streamPollTimer = null;
-                const player = document.getElementById("video-player");
-                player.src = `/api/stream/${encodeURIComponent(name)}`;
-                player.load();
-                player.play().catch(() => {});
-                setTimeout(() => requestStreamTime(true), 250);
-                setTimeout(() => {
-                    document.getElementById("video-status").classList.add("hidden");
-                }, 900);
-            }
-        } catch (e) {
-            console.error("Stream status failed:", e);
-        }
-    }, 400);
+    setVideoStatus("HLS playback is not supported in this browser.");
 }
 
 function closeModal() {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
-    clearInterval(streamPollTimer);
-    streamPollTimer = null;
+    if (hlsPlayer) {
+        hlsPlayer.destroy();
+        hlsPlayer = null;
+    }
     if (currentStreamName) {
         fetch(`/api/stream/stop/${encodeURIComponent(currentStreamName)}`, { method: "POST" }).catch(() => {});
         currentStreamName = null;
-        lastStreamTimeRequest = -1;
     }
     player.pause();
     player.removeAttribute("src");

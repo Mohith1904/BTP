@@ -50,14 +50,20 @@ DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 # ============================================================
 #  VIDEO STREAMING
 # ============================================================
-# Playback starts after this many contiguous chunks are available.
-# 48 chunks is about 2.8 MB with the default 60 KB chunks: enough to
-# avoid the fixed-delay race without making the user wait for too long.
+# The receiver now proxies HLS playlists and media segments, matching the
+# newer Hybrid WiFi/LiFi implementation. FFmpeg prepares the sender-side
+# playlist once, then the receiver asks for only the segments the player needs.
+FFMPEG_BIN = "ffmpeg"
+HLS_TIME_SECONDS = 4
+HLS_CACHE_FOLDER = os.path.join(os.path.dirname(__file__), ".hls_cache")
+STREAM_WAIT_TIMEOUT = 120.0
+
+# Legacy byte-range stream knobs are kept so old packet handlers fail gently if
+# an older client sends those control messages. The dashboard uses HLS now.
 STREAM_START_CHUNKS = 48
 STREAM_MIN_START_CHUNKS = 8
 STREAM_REQUEST_CHUNKS = 96
 STREAM_LOW_WATER_CHUNKS = 32
-STREAM_WAIT_TIMEOUT = 15.0
 STREAM_WINDOW_SECONDS = 20.0
 STREAM_START_SECONDS = 12.0
 FFPROBE_BIN = "ffprobe"
@@ -66,3 +72,4 @@ FFPROBE_BIN = "ffprobe"
 os.makedirs(SHARED_FOLDER, exist_ok=True)
 os.makedirs(RECEIVE_FOLDER, exist_ok=True)
 os.makedirs(STREAM_CACHE_FOLDER, exist_ok=True)
+os.makedirs(HLS_CACHE_FOLDER, exist_ok=True)

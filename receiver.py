@@ -9,12 +9,14 @@ import os
 import sys
 import json
 import time
-import mimetypes
 import logging
 import threading
+import hashlib
+import shutil
+from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import config
 from protocol.packet import Packet, PType
@@ -47,6 +49,11 @@ class Receiver:
         self.stream_sessions: dict[str, int] = {}  # filename -> session_id
         self.stream_requested_chunks: dict[int, dict[int, float]] = {}
         self.stream_info: dict[str, dict] = {}
+        self.hls_manifests: dict[str, dict] = {}
+        self.hls_manifest_events: dict[str, threading.Event] = {}
+        self.hls_segment_events: dict[str, threading.Event] = {}
+        self.hls_segment_errors: dict[str, str] = {}
+        self._hls_lock = threading.Lock()
         self._seq = 0
         self._file_list_event = threading.Event()
         self._state_lock = threading.Lock()
@@ -91,7 +98,9 @@ class Receiver:
         os.makedirs(root, exist_ok=True)
         for name in os.listdir(root):
             path = os.path.abspath(os.path.join(root, name))
-            if path.startswith(root + os.sep) and os.path.isfile(path):
+            if path.startswith(root + os.sep) and os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.startswith(root + os.sep) and os.path.isfile(path):
                 try:
                     os.remove(path)
                 except OSError:
@@ -107,6 +116,8 @@ class Receiver:
         self.net.on_ctrl(PType.FILE_META, self._on_file_meta)
         self.net.on_ctrl(PType.FILE_LIST_RESPONSE, self._on_file_list_response)
         self.net.on_ctrl(PType.TRANSFER_COMPLETE, self._on_transfer_complete)
+        self.net.on_ctrl(PType.STREAM_MANIFEST_RESPONSE, self._on_stream_manifest_response)
+        self.net.on_ctrl(PType.ERROR, self._on_error)
         self.net.on_ctrl(PType.SWITCH_NOTIFY, self._on_switch_notify)
         self.net.on_ctrl(PType.SWITCH_BACK, self._on_switch_back)
 
@@ -162,11 +173,20 @@ class Receiver:
         log.info("Receiving file: %s (%d chunks, %d bytes)",
                  meta["filename"], meta["total_chunks"], meta["file_size"])
 
-        output_dir = config.STREAM_CACHE_FOLDER if mode == "stream" else config.RECEIVE_FOLDER
+        output_dir = (
+            config.STREAM_CACHE_FOLDER
+            if mode in {"stream", "hls_segment"}
+            else config.RECEIVE_FOLDER
+        )
         output_path = None
         if mode == "stream":
             safe_name = meta["filename"].replace("/", "_").replace("\\", "_")
             output_path = os.path.join(output_dir, f"{sid}_{safe_name}")
+        elif mode == "hls_segment":
+            output_path = self._stream_cache_path(meta["filename"])
+            if output_path is None:
+                log.error("Rejected unsafe HLS segment path: %s", meta["filename"])
+                return
 
         reassembler = ChunkReassembler(
             filename=meta["filename"],
@@ -201,7 +221,7 @@ class Receiver:
                 "interface": self.net.active_interface,
             }
 
-        label = "Stream" if mode == "stream" else "Transfer"
+        label = "HLS segment" if mode == "hls_segment" else ("Stream" if mode == "stream" else "Transfer")
         self._add_event(f"{label} started: {meta['filename']}")
         if mode == "stream":
             self._request_stream_time(sid, 0.0, config.STREAM_START_SECONDS)
@@ -212,12 +232,39 @@ class Receiver:
         log.info("Received file list: %d files", len(self.file_list))
         self._file_list_event.set()
 
+    def _on_stream_manifest_response(self, pkt: Packet, addr, iface):
+        data = pkt.json_payload()
+        filename = data.get("filename") or data.get("path")
+        playlist = data.get("playlist", "")
+        if not filename or not playlist:
+            log.warning("Invalid HLS manifest response")
+            return
+
+        rewritten = self._rewrite_hls_playlist(filename, playlist)
+        with self._hls_lock:
+            self.hls_manifests[filename] = {
+                "playlist": rewritten,
+                "segments": data.get("segments", []),
+                "interface": iface,
+            }
+            event = self.hls_manifest_events.setdefault(filename, threading.Event())
+            event.set()
+        self._add_event(f"HLS playlist ready: {filename}")
+
+    def _on_error(self, pkt: Packet, addr, iface):
+        data = pkt.json_payload()
+        message = data.get("error", "Remote endpoint error")
+        log.error("Remote error via %s: %s", iface, message)
+        self._add_event(f"Remote error: {message}")
+
     def _on_transfer_complete(self, pkt: Packet, addr, iface):
         sid = pkt.session_id
         reassembler = self.reassemblers.get(sid)
         if not reassembler:
             return  # already handled or unknown session
-        is_stream = getattr(reassembler, "transfer_mode", "download") == "stream"
+        mode = getattr(reassembler, "transfer_mode", "download")
+        is_stream = mode == "stream"
+        is_hls_segment = mode == "hls_segment"
         if reassembler.is_complete:
             ok = reassembler.verify()
             status = "VERIFIED ✓" if ok else "HASH MISMATCH ✗"
@@ -227,7 +274,10 @@ class Receiver:
                 if sid in self.stats["transfers"]:
                     self.stats["transfers"][sid]["completed"] = True
                     self.stats["transfers"][sid]["progress"] = reassembler.progress
-            if is_stream:
+            if is_hls_segment:
+                self._mark_hls_segment_done(reassembler.filename, ok)
+                self.reassemblers.pop(sid, None)
+            elif is_stream:
                 self._add_event(f"Stream cached temporarily: {reassembler.filename}")
             else:
                 self.reassemblers.pop(sid, None)
@@ -247,7 +297,9 @@ class Receiver:
         reassembler = self.reassemblers.get(sid)
         if not reassembler:
             return  # already cleaned up
-        is_stream = getattr(reassembler, "transfer_mode", "download") == "stream"
+        mode = getattr(reassembler, "transfer_mode", "download")
+        is_stream = mode == "stream"
+        is_hls_segment = mode == "hls_segment"
 
         if reassembler.is_complete:
             ok = reassembler.verify()
@@ -264,7 +316,10 @@ class Receiver:
             if sid in self.stats["transfers"]:
                 self.stats["transfers"][sid]["completed"] = True
                 self.stats["transfers"][sid]["progress"] = reassembler.progress
-        if not is_stream or not reassembler.is_complete:
+        if is_hls_segment:
+            self._mark_hls_segment_done(reassembler.filename, reassembler.is_complete)
+            self.reassemblers.pop(sid, None)
+        elif not is_stream or not reassembler.is_complete:
             self._cleanup_reassembler(sid)
         else:
             self._add_event(f"Stream cached temporarily: {reassembler.filename}")
@@ -344,6 +399,56 @@ class Receiver:
             return None
         return filepath
 
+    @staticmethod
+    def _remote_path_is_safe(filename: str) -> bool:
+        normalized = filename.replace("\\", "/")
+        if not normalized or normalized.startswith("/") or ":" in normalized:
+            return False
+        return all(part not in {"", ".."} for part in normalized.split("/"))
+
+    @staticmethod
+    def _hls_cache_key(filename: str) -> str:
+        return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
+
+    def _stream_cache_path(self, relative_path: str) -> str | None:
+        normalized = relative_path.replace("\\", "/")
+        if normalized.startswith("/") or ":" in normalized:
+            return None
+        if any(part in {"", ".."} for part in normalized.split("/")):
+            return None
+
+        root = os.path.abspath(config.STREAM_CACHE_FOLDER)
+        resolved = os.path.abspath(os.path.join(root, normalized))
+        if not resolved.startswith(root + os.sep) and resolved != root:
+            return None
+        return resolved
+
+    def _hls_transfer_name(self, filename: str, segment: str) -> str:
+        safe_segment = Path(segment).name
+        return f"hls/{self._hls_cache_key(filename)}/{safe_segment}"
+
+    def _hls_segment_cache_path(self, filename: str, segment: str) -> str | None:
+        return self._stream_cache_path(self._hls_transfer_name(filename, segment))
+
+    def _rewrite_hls_playlist(self, filename: str, playlist: str) -> str:
+        encoded_filename = quote(filename, safe="")
+        lines = []
+        for line in playlist.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                segment = quote(Path(stripped).name, safe="")
+                lines.append(f"/api/stream/segment/{encoded_filename}/{segment}")
+            else:
+                lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    def _mark_hls_segment_done(self, transfer_name: str, ok: bool):
+        with self._hls_lock:
+            if not ok:
+                self.hls_segment_errors[transfer_name] = "segment hash verification failed"
+            event = self.hls_segment_events.setdefault(transfer_name, threading.Event())
+            event.set()
+
     def _stream_source_path(self, filename: str) -> str | None:
         reassembler = self._find_reassembler(filename)
         if reassembler:
@@ -399,16 +504,7 @@ class Receiver:
         self.net.send_ctrl(pkt, interface=self._preferred_interface())
 
     def request_stream_time(self, filename: str, timestamp: float, seconds: float | None = None) -> dict:
-        sid = self.stream_sessions.get(filename)
-        if sid is None:
-            return {"status": "missing", "requested": False}
-
-        self._request_stream_time(
-            sid,
-            timestamp,
-            seconds if seconds is not None else config.STREAM_WINDOW_SECONDS,
-        )
-        return {"status": "ok", "requested": True, "time": timestamp}
+        return {"status": "ok", "requested": False, "mode": "hls"}
 
     def _ensure_stream_buffer(self, filename: str, byte_pos: int = 0):
         sid = self.stream_sessions.get(filename)
@@ -444,88 +540,145 @@ class Receiver:
         self.net.send_ctrl(pkt, interface=iface)
         log.info("Requested file: %s via %s", filename, iface)
 
+    def request_hls_manifest(self, filename: str, timeout: float | None = None) -> dict | None:
+        if not self._remote_path_is_safe(filename):
+            return None
+
+        with self._hls_lock:
+            cached = self.hls_manifests.get(filename)
+            if cached:
+                return cached
+            event = self.hls_manifest_events.setdefault(filename, threading.Event())
+            event.clear()
+
+        deadline = time.time() + (timeout if timeout is not None else config.STREAM_WAIT_TIMEOUT)
+        requested_at = 0.0
+        while time.time() < deadline:
+            with self._hls_lock:
+                cached = self.hls_manifests.get(filename)
+                if cached:
+                    return cached
+
+            now = time.time()
+            if now - requested_at >= 1.0:
+                payload = Packet.make_json_payload({"filename": filename})
+                pkt = Packet(
+                    PType.STREAM_MANIFEST_REQUEST,
+                    seq_num=self._next_seq(),
+                    payload=payload,
+                )
+                iface = self._preferred_interface()
+                self.net.send_ctrl(pkt, interface=iface)
+                if iface != "wifi":
+                    self.net.send_ctrl(pkt, interface="wifi")
+                requested_at = now
+                log.info("Requested HLS playlist: %s via %s", filename, iface)
+
+            event.wait(timeout=0.25)
+
+        return None
+
+    def request_hls_segment(
+        self,
+        filename: str,
+        segment: str,
+        timeout: float | None = None,
+    ) -> str | None:
+        if not self._remote_path_is_safe(filename):
+            return None
+
+        safe_segment = Path(segment).name
+        transfer_name = self._hls_transfer_name(filename, safe_segment)
+        cached_path = self._hls_segment_cache_path(filename, safe_segment)
+        if cached_path is None:
+            return None
+        if os.path.exists(cached_path):
+            return cached_path
+
+        with self._hls_lock:
+            event = self.hls_segment_events.setdefault(transfer_name, threading.Event())
+            event.clear()
+            self.hls_segment_errors.pop(transfer_name, None)
+
+        deadline = time.time() + (timeout if timeout is not None else config.STREAM_WAIT_TIMEOUT)
+        requested_at = 0.0
+        while time.time() < deadline:
+            if os.path.exists(cached_path):
+                return cached_path
+
+            with self._hls_lock:
+                error = self.hls_segment_errors.get(transfer_name)
+                if error:
+                    log.error("HLS segment failed: %s", error)
+                    return None
+
+            now = time.time()
+            if now - requested_at >= 1.0:
+                payload = Packet.make_json_payload({
+                    "filename": filename,
+                    "segment": safe_segment,
+                })
+                pkt = Packet(
+                    PType.STREAM_SEGMENT_REQUEST,
+                    seq_num=self._next_seq(),
+                    payload=payload,
+                )
+                iface = self._preferred_interface()
+                self.net.send_ctrl(pkt, interface=iface)
+                if iface != "wifi":
+                    self.net.send_ctrl(pkt, interface="wifi")
+                requested_at = now
+                log.info("Requested HLS segment: %s for %s via %s", safe_segment, filename, iface)
+
+            event.wait(timeout=0.25)
+
+        return cached_path if os.path.exists(cached_path) else None
+
     def start_stream(self, filename: str) -> dict:
-        """Start a video transfer and report the current stream buffer state."""
-        filepath = self._received_path(filename)
-        if filepath is None:
+        """Prepare an HLS playlist and return the local playlist URL."""
+        if not self._remote_path_is_safe(filename):
             return {"error": "Path traversal rejected"}
 
-        if not os.path.exists(filepath) and not self._find_reassembler(filename):
-            self.request_file(filename, mode="stream")
-            self._add_event(f"Stream requested: {filename}")
+        manifest = self.request_hls_manifest(filename)
+        if manifest is None:
+            return {"error": "Timed out preparing HLS playlist"}
 
+        self._add_event(f"HLS stream requested: {filename}")
         return self.stream_status(filename)
 
     def stop_stream(self, filename: str) -> dict:
-        """Delete temporary stream chunks for a video player session."""
-        sid = self.stream_sessions.get(filename)
-        if sid is None:
+        """Delete cached HLS segments for a video player session."""
+        if not self._remote_path_is_safe(filename):
             return {"status": "ok", "deleted": False}
 
-        cancel = Packet(PType.CANCEL_TRANSFER, seq_num=self._next_seq(), session_id=sid)
-        self.net.send_ctrl(cancel, interface=self._preferred_interface())
-        self.net.send_ctrl(cancel, interface="wifi")
-        self._cleanup_reassembler(sid, delete_stream_file=True)
-        self._add_event(f"Stream cache deleted: {filename}")
-        return {"status": "ok", "deleted": True}
+        with self._hls_lock:
+            self.hls_manifests.pop(filename, None)
+            self.hls_manifest_events.pop(filename, None)
+
+        cache_dir = self._stream_cache_path(f"hls/{self._hls_cache_key(filename)}")
+        deleted = False
+        if cache_dir and os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            deleted = True
+        self._add_event(f"HLS stream cache deleted: {filename}")
+        return {"status": "ok", "deleted": deleted}
 
     def stream_status(self, filename: str) -> dict:
-        """Return how much contiguous video data is ready for HTTP playback."""
-        filepath = self._received_path(filename)
-        if filepath is None:
+        """Return HLS playlist readiness for HTTP playback."""
+        if not self._remote_path_is_safe(filename):
             return {"error": "Path traversal rejected", "ready": False}
 
-        reassembler = self._find_reassembler(filename)
-        if reassembler:
-            total_chunks = reassembler.total_chunks
-            start_chunks = min(
-                total_chunks,
-                max(config.STREAM_MIN_START_CHUNKS, min(config.STREAM_START_CHUNKS, total_chunks)),
-            )
-            contiguous_chunks = reassembler.contiguous_chunks
-            if getattr(reassembler, "transfer_mode", "download") == "stream":
-                ready = reassembler.has_chunk_range(0, max(0, start_chunks - 1))
-            else:
-                ready = reassembler.is_complete or contiguous_chunks >= start_chunks
-            return {
-                "filename": filename,
-                "ready": ready,
-                "complete": reassembler.is_complete,
-                "file_size": reassembler.file_size,
-                "available_bytes": reassembler.contiguous_bytes,
-                "contiguous_chunks": contiguous_chunks,
-                "total_chunks": total_chunks,
-                "start_chunks": start_chunks,
-                "stream": getattr(reassembler, "stream_info", {}),
-                "progress": reassembler.progress,
-                "interface": self.net.active_interface,
-            }
+        with self._hls_lock:
+            manifest = self.hls_manifests.get(filename)
 
-        if os.path.exists(filepath):
-            size = os.path.getsize(filepath)
-            return {
-                "filename": filename,
-                "ready": True,
-                "complete": True,
-                "file_size": size,
-                "available_bytes": size,
-                "contiguous_chunks": 0,
-                "total_chunks": 0,
-                "start_chunks": 0,
-                "progress": 1.0,
-                "interface": self.net.active_interface,
-            }
-
+        playlist_url = f"/api/stream/playlist/{quote(filename, safe='')}"
         return {
             "filename": filename,
-            "ready": False,
-            "complete": False,
-            "file_size": 0,
-            "available_bytes": 0,
-            "contiguous_chunks": 0,
-            "total_chunks": 0,
-            "start_chunks": config.STREAM_MIN_START_CHUNKS,
-            "progress": 0.0,
+            "ready": manifest is not None,
+            "complete": manifest is not None,
+            "playlist_url": playlist_url,
+            "segment_count": len((manifest or {}).get("segments", [])),
+            "mode": "hls",
             "interface": self.net.active_interface,
         }
 
@@ -574,12 +727,24 @@ class Receiver:
                 elif path == "/api/refresh_files":
                     files = self.receiver.request_file_list()
                     self._json_response({"files": files})
+                elif path.startswith("/api/stream/playlist/"):
+                    filename = unquote(path[len("/api/stream/playlist/"):])
+                    self._serve_hls_playlist(filename)
+                elif path.startswith("/api/stream/segment/"):
+                    rest = path[len("/api/stream/segment/"):]
+                    parts = rest.split("/", 1)
+                    if len(parts) != 2:
+                        self.send_error(404, "segment not found")
+                        return
+                    filename = unquote(parts[0])
+                    segment = unquote(parts[1])
+                    self._serve_hls_segment(filename, segment)
                 elif path.startswith("/api/stream/status/"):
                     filename = unquote(path[len("/api/stream/status/"):])
                     self._json_response(self.receiver.stream_status(filename))
                 elif path.startswith("/api/stream/"):
                     filename = unquote(path[len("/api/stream/"):])
-                    self._serve_stream(filename)
+                    self._serve_hls_playlist(filename)
                 elif path == "/api/events":
                     self._sse_stream()
                 else:
@@ -600,12 +765,7 @@ class Receiver:
                         self._json_response({"status": "buffering", **status})
                 elif path.startswith("/api/stream/time/"):
                     filename = unquote(path[len("/api/stream/time/"):])
-                    body = self._read_json_body()
-                    self._json_response(self.receiver.request_stream_time(
-                        filename,
-                        float(body.get("time", 0) or 0),
-                        float(body.get("seconds", config.STREAM_WINDOW_SECONDS) or config.STREAM_WINDOW_SECONDS),
-                    ))
+                    self._json_response(self.receiver.request_stream_time(filename, 0.0))
                 elif path.startswith("/api/stream/stop/"):
                     filename = unquote(path[len("/api/stream/stop/"):])
                     self._json_response(self.receiver.stop_stream(filename))
@@ -631,135 +791,52 @@ class Receiver:
                 self.end_headers()
                 self.wfile.write(body)
 
-            # REPLACE ONLY THE _serve_stream FUNCTION WITH THIS
-
-        def _serve_stream(self, filename):
-            """Serve streamed/downloaded files with HTTP Range support."""
-            filepath = self.receiver._received_path(filename)
-
-            if filepath is None:
-                self.send_error(403, "Path traversal rejected")
-                return
-
-            reassembler = self.receiver._find_reassembler(filename)
-
-            # fully downloaded normal file
-            if not reassembler:
-                if not os.path.exists(filepath):
-                    self.send_error(404, "File not found")
+            def _serve_hls_playlist(self, filename):
+                status = self.receiver.start_stream(filename)
+                if "error" in status:
+                    self.send_error(504, status["error"])
                     return
 
-                file_size = os.path.getsize(filepath)
-                content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                with self.receiver._hls_lock:
+                    manifest = self.receiver.hls_manifests.get(filename)
+                if not manifest:
+                    self.send_error(404, "playlist not found")
+                    return
 
-                range_header = self.headers.get("Range")
-
-                if range_header:
-                    range_str = range_header.replace("bytes=", "")
-                    parts = range_str.split("-")
-
-                    start = int(parts[0]) if parts[0] else 0
-                    end = int(parts[1]) if parts[1] else file_size - 1
-                    end = min(end, file_size - 1)
-
-                    if start > end:
-                        self.send_error(416)
-                        return
-
-                    length = end - start + 1
-
-                    self.send_response(206)
-                    self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                    self.send_header("Content-Length", str(length))
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-
-                    with open(filepath, "rb") as f:
-                        f.seek(start)
-                        self.wfile.write(f.read(length))
-
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Length", str(file_size))
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-
-                    with open(filepath, "rb") as f:
-                        while True:
-                            data = f.read(65536)
-                            if not data:
-                                break
-                            self.wfile.write(data)
-
-                return
-
-            # STREAM MODE USING SPARSE BUFFER
-            file_size = reassembler.file_size
-            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-            range_header = self.headers.get("Range")
-
-            if range_header:
-                range_str = range_header.replace("bytes=", "")
-                parts = range_str.split("-")
-
-                start = int(parts[0]) if parts[0] else 0
-                end = int(parts[1]) if parts[1] else file_size - 1
-                end = min(end, file_size - 1)
-
-            else:
-                start = 0
-                end = min(
-                    file_size - 1,
-                    config.STREAM_START_CHUNKS * reassembler.chunk_size - 1
-                )
-
-            if start > end:
-                self.send_error(416)
-                return
-
-            self.receiver._ensure_stream_buffer(filename, end)
-
-            ready = self.receiver.wait_for_stream_bytes(
-                filename,
-                start,
-                end,
-                config.STREAM_WAIT_TIMEOUT,
-            )
-
-            if not ready:
-                self.send_response(416)
-                self.send_header("Content-Range", f"bytes */{file_size}")
-                self.send_header("Accept-Ranges", "bytes")
+                body = manifest["playlist"].encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", len(body))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                return
+                self.wfile.write(body)
 
-            data = reassembler.read_range(start, end)
+            def _serve_hls_segment(self, filename, segment):
+                filepath = self.receiver.request_hls_segment(filename, segment)
+                if filepath is None:
+                    self.send_error(504, "segment transfer timed out")
+                    return
 
-            if not data:
-                self.send_error(503, "No stream data available")
-                return
+                path = Path(filepath)
+                if not path.exists():
+                    self.send_error(404, "segment not found")
+                    return
 
-            length = len(data)
+                data = path.read_bytes()
+                if path.suffix == ".m4s":
+                    content_type = "video/iso.segment"
+                elif path.suffix == ".mp4":
+                    content_type = "video/mp4"
+                else:
+                    content_type = "video/mp2t"
 
-            if range_header:
-                self.send_response(206)
-                self.send_header("Content-Range", f"bytes {start}-{start+length-1}/{file_size}")
-            else:
-                self.send_response(206)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", len(data))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
 
-            self.send_header("Content-Length", str(length))
-            self.send_header("Content-Type", content_type)
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            self.wfile.write(data)
             def _sse_stream(self):
                 """Server-Sent Events stream for real-time dashboard updates."""
                 self.send_response(200)

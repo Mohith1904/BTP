@@ -11,15 +11,23 @@ import threading
 class FileChunker:
     """Splits a file into numbered chunks for transmission."""
 
-    def __init__(self, filepath: str, chunk_size: int = 60 * 1024):
+    def __init__(
+        self,
+        filepath: str,
+        chunk_size: int = 60 * 1024,
+        transfer_name: str | None = None,
+    ):
         self.filepath = filepath
         self.chunk_size = chunk_size
         self.file_size = os.path.getsize(filepath)
         self.total_chunks = max(1, (self.file_size + chunk_size - 1) // chunk_size)
+        self.transfer_name = transfer_name
         self._hash: str | None = None
 
     @property
     def filename(self) -> str:
+        if self.transfer_name:
+            return self.transfer_name
         return os.path.basename(self.filepath)
 
     def file_hash(self) -> str:

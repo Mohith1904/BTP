@@ -93,9 +93,8 @@ class StreamBuffer:
 
         with self._lock:
             for chunk_id in range(start_chunk, end_chunk + 1):
-
                 if chunk_id not in self._chunk_cache:
-                    break
+                    return b""
 
                 data = self._chunk_cache[chunk_id]
 
@@ -105,9 +104,6 @@ class StreamBuffer:
                 slice_end = min(len(data), end - chunk_start + 1)
 
                 parts.append(data[slice_start:slice_end])
-
-        if not parts:
-            return b""
 
         return b"".join(parts)
 

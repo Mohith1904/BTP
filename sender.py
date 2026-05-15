@@ -12,10 +12,13 @@ import time
 import random
 import logging
 import threading
+import hashlib
+from pathlib import Path
 
 import config
 from protocol.packet import Packet, PType
 from protocol.chunk_manager import FileChunker
+from protocol.hls import HLSManager
 from protocol.video_index import VideoStreamIndex, ffprobe_available
 from network.manager import NetworkManager
 
@@ -42,6 +45,7 @@ class Sender:
         self.active_transfers: dict[int, dict] = {}   # session_id -> state
         self.acked_chunks: dict[int, set] = {}         # session_id -> set of acked chunk_ids
         self.stream_sources: dict[int, dict] = {}      # session_id -> on-demand stream state
+        self.hls = HLSManager(config.HLS_CACHE_FOLDER)
         self._seq = 0
         self._state_lock = threading.Lock()  # protects shared mutable state
 
@@ -83,6 +87,8 @@ class Sender:
         self.net.on_ctrl(PType.CANCEL_TRANSFER, self._on_cancel_transfer)
         self.net.on_ctrl(PType.STREAM_CHUNK_REQUEST, self._on_stream_chunk_request)
         self.net.on_ctrl(PType.STREAM_TIME_REQUEST, self._on_stream_time_request)
+        self.net.on_ctrl(PType.STREAM_MANIFEST_REQUEST, self._on_stream_manifest_request)
+        self.net.on_ctrl(PType.STREAM_SEGMENT_REQUEST, self._on_stream_segment_request)
         self.net.on_ctrl(PType.SWITCH_ACK, self._on_switch_ack)
         self.net.on_ctrl(PType.SWITCH_BACK_ACK, self._on_switchback_ack)
 
@@ -117,26 +123,68 @@ class Sender:
         info = pkt.json_payload()
         filename = info.get("filename", "")
         mode = info.get("mode", "download")
-        filepath = os.path.join(config.SHARED_FOLDER, filename)
-
-        # Path traversal protection
-        root = os.path.abspath(config.SHARED_FOLDER)
-        resolved = os.path.abspath(filepath)
-        if not resolved.startswith(root + os.sep) and resolved != root:
-            log.error("Path traversal rejected: %s", filename)
-            return
-
-        if not os.path.isfile(filepath):
-            log.error("Requested file not found: %s", filename)
+        filepath = self._resolve_shared_file(filename)
+        if filepath is None:
             return
 
         log.info("File requested: %s [%s] (via %s)", filename, mode, iface)
         session_id = random.randint(1, 0xFFFFFFFF)
         if mode == "stream":
-            self._start_stream_session(filepath, session_id)
+            threading.Thread(
+                target=self._send_hls_manifest,
+                args=(filename, filepath, iface),
+                daemon=True,
+            ).start()
         else:
             t = threading.Thread(target=self._send_file, args=(filepath, session_id, mode), daemon=True)
             t.start()
+
+    def _on_stream_manifest_request(self, pkt: Packet, addr, iface):
+        info = pkt.json_payload()
+        filename = info.get("filename") or info.get("path", "")
+        filepath = self._resolve_shared_file(filename)
+        if filepath is None:
+            self._send_error(f"Requested video not found: {filename}", iface)
+            return
+        threading.Thread(
+            target=self._send_hls_manifest,
+            args=(filename, filepath, iface),
+            daemon=True,
+        ).start()
+
+    def _on_stream_segment_request(self, pkt: Packet, addr, iface):
+        info = pkt.json_payload()
+        filename = info.get("filename") or info.get("path", "")
+        segment = Path(str(info.get("segment", ""))).name
+        filepath = self._resolve_shared_file(filename)
+        if filepath is None or not segment:
+            self._send_error(f"Invalid HLS segment request: {filename} / {segment}", iface)
+            return
+
+        threading.Thread(
+            target=self._send_hls_segment,
+            args=(filename, filepath, segment, iface),
+            daemon=True,
+        ).start()
+
+    def _send_hls_segment(self, filename: str, filepath: str, segment: str, iface: str):
+        try:
+            segment_path = self.hls.segment_path(filepath, segment)
+        except Exception as exc:
+            log.exception("Could not resolve HLS segment")
+            self._send_error(str(exc), iface)
+            return
+
+        cache_key = self._hls_cache_key(filename)
+        transfer_name = f"hls/{cache_key}/{segment}"
+        session_id = random.randint(1, 0xFFFFFFFF)
+        log.info("HLS segment requested: %s for %s via %s", segment, filename, iface)
+        t = threading.Thread(
+            target=self._send_file,
+            args=(str(segment_path), session_id, "hls_segment", transfer_name),
+            daemon=True,
+        )
+        t.start()
 
     def _on_cancel_transfer(self, pkt: Packet, addr, iface):
         with self._state_lock:
@@ -197,10 +245,57 @@ class Sender:
         log.info("Receiver acknowledged switch back to LiFi")
         self._switchback_ack_event.set()
 
+    def _send_hls_manifest(self, filename: str, filepath: str, iface: str):
+        try:
+            log.info("Preparing HLS manifest for %s", filename)
+            manifest = self.hls.prepare(filepath)
+            payload = Packet.make_json_payload({
+                "filename": filename,
+                "playlist": manifest.playlist_text,
+                "segments": [Path(segment).name for segment in manifest.segments],
+            })
+            if len(payload) > 60000:
+                raise ValueError("HLS manifest is too large for one control packet")
+            resp = Packet(
+                PType.STREAM_MANIFEST_RESPONSE,
+                seq_num=self._next_seq(),
+                payload=payload,
+            )
+            self.net.send_ctrl(resp, interface=iface)
+            log.info("HLS manifest ready: %s (%d segments)", filename, len(manifest.segments))
+        except Exception as exc:
+            log.exception("Could not prepare HLS manifest")
+            self._send_error(str(exc), iface)
+
+    def _send_error(self, message: str, iface: str | None = None):
+        pkt = Packet(
+            PType.ERROR,
+            seq_num=self._next_seq(),
+            payload=Packet.make_json_payload({"error": message}),
+        )
+        self.net.send_ctrl(pkt, interface=iface)
+
+    def _resolve_shared_file(self, filename: str) -> str | None:
+        filepath = os.path.join(config.SHARED_FOLDER, filename)
+        root = os.path.abspath(config.SHARED_FOLDER)
+        resolved = os.path.abspath(filepath)
+        if not resolved.startswith(root + os.sep) and resolved != root:
+            log.error("Path traversal rejected: %s", filename)
+            return None
+        if not os.path.isfile(resolved):
+            log.error("Requested file not found: %s", filename)
+            return None
+        return resolved
+
+    @staticmethod
+    def _hls_cache_key(filename: str) -> str:
+        return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
+
     # ── shared folder scanning ──────────────────────────────
     def _scan_shared_folder(self) -> list[dict]:
         files = []
         for root, dirs, filenames in os.walk(config.SHARED_FOLDER):
+            dirs[:] = [d for d in dirs if d not in {".hls", ".hls_cache"}]
             for fname in filenames:
                 fpath = os.path.join(root, fname)
                 rel = os.path.relpath(fpath, config.SHARED_FOLDER).replace("\\", "/")
@@ -273,8 +368,14 @@ class Sender:
             self.stats["chunks_sent"] += 1
         log.debug("Sent stream chunks %d-%d for session %d", start, end, session_id)
 
-    def _send_file(self, filepath: str, session_id: int, mode: str = "download"):
-        chunker = FileChunker(filepath, config.CHUNK_SIZE)
+    def _send_file(
+        self,
+        filepath: str,
+        session_id: int,
+        mode: str = "download",
+        transfer_name: str | None = None,
+    ):
+        chunker = FileChunker(filepath, config.CHUNK_SIZE, transfer_name=transfer_name)
         meta = chunker.metadata()
         meta["mode"] = mode
         total = chunker.total_chunks

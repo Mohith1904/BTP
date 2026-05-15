@@ -47,6 +47,10 @@ class PType:
     CANCEL_TRANSFER   = 0x0E
     STREAM_CHUNK_REQUEST = 0x0F
     STREAM_TIME_REQUEST = 0x10
+    STREAM_MANIFEST_REQUEST = 0x11
+    STREAM_MANIFEST_RESPONSE = 0x12
+    STREAM_SEGMENT_REQUEST = 0x13
+    ERROR = 0x7F
 
     _NAMES = {
         0x01: "DATA",       0x02: "ACK",
@@ -59,6 +63,10 @@ class PType:
         0x0E: "CANCEL_TRANSFER",
         0x0F: "STREAM_CHUNK_REQUEST",
         0x10: "STREAM_TIME_REQUEST",
+        0x11: "STREAM_MANIFEST_REQUEST",
+        0x12: "STREAM_MANIFEST_RESPONSE",
+        0x13: "STREAM_SEGMENT_REQUEST",
+        0x7F: "ERROR",
     }
 
     @classmethod
