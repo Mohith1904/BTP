@@ -148,8 +148,7 @@ body::before {
     width: 36px; height: 36px;
     border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
-    font-size: .62rem;
-    font-weight: 700;
+    font-size: 1.1rem;
     background: rgba(124,92,252,0.1);
     flex-shrink: 0;
 }
@@ -287,19 +286,6 @@ body::before {
     display: flex; align-items: center; justify-content: center;
 }
 #video-player { width: 100%; display: block; }
-.video-status {
-    position: absolute;
-    left: 1rem;
-    bottom: 3.1rem;
-    padding: .35rem .6rem;
-    border-radius: 8px;
-    background: rgba(0,0,0,0.7);
-    border: 1px solid var(--border);
-    color: var(--text);
-    font-size: .78rem;
-    pointer-events: none;
-}
-.video-status.hidden { display: none; }
 #video-title {
     padding: .6rem 1rem;
     font-size: .85rem; color: var(--text-muted);

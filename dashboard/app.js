@@ -1,23 +1,22 @@
-// State
+// ── State ──────────────────────────────────────────
 let currentInterface = "lifi";
 let lastBytes = 0;
 let lastTime = Date.now();
-let currentStreamName = null;
-let hlsPlayer = null;
 
-// DOM refs
-const dotIface = document.getElementById("dot-interface");
-const lblIface = document.getElementById("label-interface");
-const lblConn = document.getElementById("label-connection");
-const lblUptime = document.getElementById("label-uptime");
-const fileListEl = document.getElementById("file-list");
-const transferEl = document.getElementById("transfer-list");
-const eventLogEl = document.getElementById("event-log");
-const statBytes = document.getElementById("stat-bytes");
-const statChunks = document.getElementById("stat-chunks");
-const statFails = document.getElementById("stat-failovers");
-const statBw = document.getElementById("stat-bandwidth");
+// ── DOM refs ──────────────────────────────────────
+const dotIface    = document.getElementById("dot-interface");
+const lblIface    = document.getElementById("label-interface");
+const lblConn     = document.getElementById("label-connection");
+const lblUptime   = document.getElementById("label-uptime");
+const fileListEl  = document.getElementById("file-list");
+const transferEl  = document.getElementById("transfer-list");
+const eventLogEl  = document.getElementById("event-log");
+const statBytes   = document.getElementById("stat-bytes");
+const statChunks  = document.getElementById("stat-chunks");
+const statFails   = document.getElementById("stat-failovers");
+const statBw      = document.getElementById("stat-bandwidth");
 
+// ── Helpers ───────────────────────────────────────
 function formatBytes(b) {
     if (b < 1024) return b + " B";
     if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
@@ -37,26 +36,29 @@ function formatTime(secs) {
 
 function fileIcon(ext) {
     const map = {
-        ".mp4": "VID", ".mkv": "VID", ".avi": "VID", ".mov": "VID", ".webm": "VID",
-        ".mp3": "AUD", ".wav": "AUD", ".flac": "AUD", ".aac": "AUD",
-        ".jpg": "IMG", ".jpeg": "IMG", ".png": "IMG", ".gif": "IMG", ".webp": "IMG", ".bmp": "IMG",
-        ".pdf": "PDF", ".doc": "DOC", ".docx": "DOC", ".txt": "TXT", ".csv": "CSV",
-        ".zip": "ZIP", ".rar": "ZIP", ".7z": "ZIP", ".tar": "ZIP",
-        ".py": "PY", ".js": "JS", ".html": "HTML", ".css": "CSS",
-        ".exe": "EXE", ".msi": "MSI",
+        ".mp4":"🎬", ".mkv":"🎬", ".avi":"🎬", ".mov":"🎬", ".webm":"🎬",
+        ".mp3":"🎵", ".wav":"🎵", ".flac":"🎵", ".aac":"🎵",
+        ".jpg":"🖼️", ".jpeg":"🖼️", ".png":"🖼️", ".gif":"🖼️", ".webp":"🖼️", ".bmp":"🖼️",
+        ".pdf":"📄", ".doc":"📄", ".docx":"📄", ".txt":"📃", ".csv":"📊",
+        ".zip":"📦", ".rar":"📦", ".7z":"📦", ".tar":"📦",
+        ".py":"🐍", ".js":"💛", ".html":"🌐", ".css":"🎨",
+        ".exe":"⚙️", ".msi":"⚙️",
     };
-    return map[ext] || "FILE";
+    return map[ext] || "📁";
 }
 
-const VIDEO_EXTS = [".mp4", ".mkv", ".avi", ".mov", ".webm"];
+const VIDEO_EXTS = [".mp4",".mkv",".avi",".mov",".webm"];
 function isVideo(ext) { return VIDEO_EXTS.includes(ext); }
 
+// ── Interface banner flash ────────────────────────
 let bannerEl = null;
 function flashBanner(iface) {
     if (bannerEl) bannerEl.remove();
     bannerEl = document.createElement("div");
     bannerEl.className = `interface-banner ${iface}`;
-    bannerEl.textContent = iface === "lifi" ? "Switched to LiFi" : "Switched to WiFi";
+    bannerEl.textContent = iface === "lifi"
+        ? "⚡ Switched to LiFi"
+        : "📡 Switched to WiFi";
     document.body.appendChild(bannerEl);
     requestAnimationFrame(() => bannerEl.classList.add("show"));
     setTimeout(() => {
@@ -65,41 +67,24 @@ function flashBanner(iface) {
     }, 2500);
 }
 
+// ── File list ─────────────────────────────────────
 function renderFiles(files) {
     if (!files || files.length === 0) {
         fileListEl.innerHTML = '<p class="muted">No files shared yet. Place files in the sender\'s <code>shared/</code> folder.</p>';
         return;
     }
-
-    fileListEl.replaceChildren(...files.map(f => {
-        const item = document.createElement("div");
-        item.className = "file-item";
-
-        const icon = document.createElement("div");
-        icon.className = "file-icon";
-        icon.textContent = fileIcon(f.ext);
-
-        const info = document.createElement("div");
-        info.className = "file-info";
-
-        const name = document.createElement("div");
-        name.className = "file-name";
-        name.title = f.name;
-        name.textContent = f.name;
-
-        const size = document.createElement("div");
-        size.className = "file-size";
-        size.textContent = formatBytes(f.size);
-
-        const action = document.createElement("button");
-        action.className = "file-action";
-        action.textContent = isVideo(f.ext) ? "Stream" : "Download";
-        action.addEventListener("click", () => requestFile(f.name, f.ext));
-
-        info.append(name, size);
-        item.append(icon, info, action);
-        return item;
-    }));
+    fileListEl.innerHTML = files.map(f => `
+        <div class="file-item" data-name="${f.name}" data-ext="${f.ext}">
+            <div class="file-icon">${fileIcon(f.ext)}</div>
+            <div class="file-info">
+                <div class="file-name" title="${f.name}">${f.name}</div>
+                <div class="file-size">${formatBytes(f.size)}</div>
+            </div>
+            <button class="file-action" onclick="requestFile('${f.name}', '${f.ext}')">
+                ${isVideo(f.ext) ? '▶ Stream' : '⬇ Download'}
+            </button>
+        </div>
+    `).join("");
 }
 
 async function refreshFiles() {
@@ -112,41 +97,17 @@ async function refreshFiles() {
     }
 }
 document.getElementById("btn-refresh").addEventListener("click", refreshFiles);
-const videoPlayer = document.getElementById("video-player");
-videoPlayer.addEventListener("ended", closeModal);
 
-window.addEventListener("beforeunload", () => {
-    if (!currentStreamName) return;
-    navigator.sendBeacon(`/api/stream/stop/${encodeURIComponent(currentStreamName)}`);
-});
-
+// ── Request file / stream video ───────────────────
 async function requestFile(name, ext) {
-    if (isVideo(ext)) {
-        startVideoStream(name);
-        return;
-    }
-
     try {
         await fetch(`/api/download/${encodeURIComponent(name)}`, { method: "POST" });
+        if (isVideo(ext)) {
+            // Wait a moment for chunks to start arriving, then open video player
+            setTimeout(() => openVideoModal(name), 1500);
+        }
     } catch (e) {
         console.error("Request failed:", e);
-    }
-}
-
-async function startVideoStream(name) {
-    openVideoModal(name);
-    setVideoStatus("Preparing HLS playlist...");
-
-    try {
-        const r = await fetch(`/api/stream/start/${encodeURIComponent(name)}`, { method: "POST" });
-        if (!r.ok) throw new Error("Stream start failed");
-        const status = await r.json();
-        if (!status.playlist_url) throw new Error("Missing playlist URL");
-        setVideoStatus("Playlist ready. Starting playback...");
-        playHls(status.playlist_url);
-    } catch (e) {
-        console.error("Stream failed:", e);
-        setVideoStatus("Could not start stream.");
     }
 }
 
@@ -154,81 +115,28 @@ function openVideoModal(name) {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
     const title = document.getElementById("video-title");
-    if (hlsPlayer) {
-        hlsPlayer.destroy();
-        hlsPlayer = null;
-    }
-    currentStreamName = name;
-    player.pause();
-    player.removeAttribute("src");
-    player.load();
+    player.src = `/api/stream/${encodeURIComponent(name)}`;
     title.textContent = name;
     modal.classList.remove("hidden");
 }
-
-function setVideoStatus(text) {
-    const status = document.getElementById("video-status");
-    status.textContent = text;
-    status.classList.remove("hidden");
-}
-
-function playHls(playlistUrl) {
-    const player = document.getElementById("video-player");
-    if (window.Hls && window.Hls.isSupported()) {
-        hlsPlayer = new Hls({
-            lowLatencyMode: false,
-            backBufferLength: 30,
-        });
-        hlsPlayer.loadSource(playlistUrl);
-        hlsPlayer.attachMedia(player);
-        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
-            player.play().catch(() => {});
-            document.getElementById("video-status").classList.add("hidden");
-        });
-        hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
-            if (data.fatal) setVideoStatus("Playback error. Try reopening the stream.");
-        });
-        return;
-    }
-
-    if (player.canPlayType("application/vnd.apple.mpegurl")) {
-        player.src = playlistUrl;
-        player.load();
-        player.play().catch(() => {});
-        document.getElementById("video-status").classList.add("hidden");
-        return;
-    }
-
-    setVideoStatus("HLS playback is not supported in this browser.");
-}
-
 function closeModal() {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
-    if (hlsPlayer) {
-        hlsPlayer.destroy();
-        hlsPlayer = null;
-    }
-    if (currentStreamName) {
-        fetch(`/api/stream/stop/${encodeURIComponent(currentStreamName)}`, { method: "POST" }).catch(() => {});
-        currentStreamName = null;
-    }
     player.pause();
-    player.removeAttribute("src");
-    player.load();
+    player.src = "";
     modal.classList.add("hidden");
 }
 
+// ── Transfers ─────────────────────────────────────
 function renderTransfers(transfers) {
     const entries = Object.entries(transfers || {});
     if (entries.length === 0) {
         transferEl.innerHTML = '<p class="muted">No active transfers</p>';
         return;
     }
-
-    transferEl.innerHTML = entries.map(([, t]) => {
-        const pct = ((t.progress || 0) * 100).toFixed(1);
-        const iface = t.interface || currentInterface;
+    transferEl.innerHTML = entries.map(([sid, t]) => {
+        const pct = (t.progress * 100).toFixed(1);
+        const iface = currentInterface;
         return `
             <div class="transfer-item">
                 <div class="transfer-header">
@@ -236,25 +144,25 @@ function renderTransfers(transfers) {
                     <span class="transfer-pct">${pct}%</span>
                 </div>
                 <div class="progress-bar">
-                    <div class="progress-fill ${iface === "wifi" ? "wifi" : ""}"
+                    <div class="progress-fill ${iface === 'wifi' ? 'wifi' : ''}"
                          style="width:${pct}%"></div>
                 </div>
                 <div class="transfer-meta">
                     <span>${formatBytes(t.bytes || 0)} / ${formatBytes(t.file_size || 0)}</span>
                     <span>${t.received || 0} / ${t.total_chunks || 0} chunks</span>
-                    <span>${t.completed ? "Done" : "Transferring"}</span>
+                    <span>${t.completed ? '✓ Done' : '⟳ Transferring'}</span>
                 </div>
             </div>
         `;
     }).join("");
 }
 
+// ── Events ────────────────────────────────────────
 function renderEvents(events) {
     if (!events || events.length === 0) {
-        eventLogEl.innerHTML = '<p class="muted">Waiting for events...</p>';
+        eventLogEl.innerHTML = '<p class="muted">Waiting for events…</p>';
         return;
     }
-
     eventLogEl.innerHTML = events.slice().reverse().map(e => {
         let cls = "";
         if (e.msg.includes("Failover")) cls = "failover";
@@ -269,6 +177,7 @@ function renderEvents(events) {
     }).join("");
 }
 
+// ── SSE: real-time updates ────────────────────────
 function connectSSE() {
     const source = new EventSource("/api/events");
 
@@ -276,20 +185,19 @@ function connectSSE() {
         try {
             const s = JSON.parse(ev.data);
             updateDashboard(s);
-        } catch (e) {
-            // Ignore partial or malformed SSE frames.
-        }
+        } catch (e) { /* ignore parse errors */ }
     };
 
     source.onerror = () => {
         source.close();
-        lblConn.textContent = "Reconnecting...";
+        lblConn.textContent = "Reconnecting…";
         document.querySelector("#pill-connection .pill-dot").className = "pill-dot dot-red";
         setTimeout(connectSSE, 2000);
     };
 }
 
 function updateDashboard(s) {
+    // Interface
     const iface = s.active_interface || "lifi";
     if (iface !== currentInterface) {
         flashBanner(iface);
@@ -300,27 +208,35 @@ function updateDashboard(s) {
     lblConn.textContent = "Connected";
     document.querySelector("#pill-connection .pill-dot").className = "pill-dot dot-green";
 
+    // Uptime
     const uptime = Date.now() / 1000 - (s.start_time || Date.now() / 1000);
     lblUptime.textContent = formatTime(uptime);
 
+    // Stats
     statBytes.textContent = formatBytes(s.bytes_received || 0);
     statChunks.textContent = s.chunks_received || 0;
     statFails.textContent = s.failover_count || 0;
 
+    // Bandwidth
     const now = Date.now();
     const dt = (now - lastTime) / 1000;
     if (dt > 0.4) {
         const bw = ((s.bytes_received || 0) - lastBytes) / dt;
-        statBw.textContent = bw > 0 ? formatBytes(bw) + "/s" : "-";
+        statBw.textContent = bw > 0 ? formatBytes(bw) + "/s" : "—";
         lastBytes = s.bytes_received || 0;
         lastTime = now;
     }
 
+    // Transfers
     renderTransfers(s.transfers);
+
+    // Events
     renderEvents(s.events);
 }
 
+// ── Init ──────────────────────────────────────────
 (async function init() {
+    // Load initial file list
     try {
         const r = await fetch("/api/files");
         const d = await r.json();
@@ -329,5 +245,6 @@ function updateDashboard(s) {
         fileListEl.innerHTML = '<p class="muted">Could not load files</p>';
     }
 
+    // Start SSE
     connectSSE();
 })();

@@ -44,13 +44,6 @@ class PType:
     FILE_LIST_REQUEST = 0x0B
     FILE_LIST_RESPONSE= 0x0C
     FILE_REQUEST      = 0x0D
-    CANCEL_TRANSFER   = 0x0E
-    STREAM_CHUNK_REQUEST = 0x0F
-    STREAM_TIME_REQUEST = 0x10
-    STREAM_MANIFEST_REQUEST = 0x11
-    STREAM_MANIFEST_RESPONSE = 0x12
-    STREAM_SEGMENT_REQUEST = 0x13
-    ERROR = 0x7F
 
     _NAMES = {
         0x01: "DATA",       0x02: "ACK",
@@ -60,13 +53,6 @@ class PType:
         0x09: "FILE_META",      0x0A: "TRANSFER_COMPLETE",
         0x0B: "FILE_LIST_REQ",  0x0C: "FILE_LIST_RESP",
         0x0D: "FILE_REQUEST",
-        0x0E: "CANCEL_TRANSFER",
-        0x0F: "STREAM_CHUNK_REQUEST",
-        0x10: "STREAM_TIME_REQUEST",
-        0x11: "STREAM_MANIFEST_REQUEST",
-        0x12: "STREAM_MANIFEST_RESPONSE",
-        0x13: "STREAM_SEGMENT_REQUEST",
-        0x7F: "ERROR",
     }
 
     @classmethod
@@ -138,10 +124,6 @@ class Packet:
 
         if magic != MAGIC:
             raise ValueError("Invalid magic bytes")
-        if _ver != VERSION:
-            raise ValueError(f"Unsupported protocol version: {_ver}")
-        if len(body) < HEADER_SIZE + plen:
-            raise ValueError(f"Payload length mismatch: header says {plen}, but only {len(body) - HEADER_SIZE} bytes available")
 
         payload = body[HEADER_SIZE: HEADER_SIZE + plen]
         return cls(

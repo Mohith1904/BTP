@@ -25,18 +25,6 @@ Sender (Laptop A)                          Receiver (Laptop B)
 pip install -r requirements.txt
 ```
 
-### 1b. Install FFmpeg for HLS video streaming
-Video streaming now follows the newer `Hybrid Wifi Lifi` project: the sender converts a video into an HLS playlist and media segments, and the receiver/dashboard requests only the segments needed for playback.
-
-On Windows, install FFmpeg:
-```powershell
-winget install "FFmpeg (Essentials Build)"
-```
-Then open a new terminal and verify:
-```powershell
-ffmpeg -version
-```
-
 ### 2. Configure IPs
 Edit `config.py` with your actual network IPs:
 ```python
@@ -90,5 +78,5 @@ On the receiver, open: **http://localhost:8080**
 - **Automatic switch-back** — returns to LiFi when light recovers
 - **Windowed sending** — 16 chunks in flight for maximum throughput
 - **File integrity** — SHA-256 verification on complete transfers
-- **Video streaming** - HLS playlist + on-demand media segments for reliable playback and seeking
+- **Video streaming** — HTTP Range requests for progressive playback
 - **Live dashboard** — real-time stats via Server-Sent Events

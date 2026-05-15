@@ -11,23 +11,15 @@ import threading
 class FileChunker:
     """Splits a file into numbered chunks for transmission."""
 
-    def __init__(
-        self,
-        filepath: str,
-        chunk_size: int = 60 * 1024,
-        transfer_name: str | None = None,
-    ):
+    def __init__(self, filepath: str, chunk_size: int = 60 * 1024):
         self.filepath = filepath
         self.chunk_size = chunk_size
         self.file_size = os.path.getsize(filepath)
         self.total_chunks = max(1, (self.file_size + chunk_size - 1) // chunk_size)
-        self.transfer_name = transfer_name
         self._hash: str | None = None
 
     @property
     def filename(self) -> str:
-        if self.transfer_name:
-            return self.transfer_name
         return os.path.basename(self.filepath)
 
     def file_hash(self) -> str:
@@ -66,8 +58,6 @@ class ChunkReassembler:
         chunk_size: int,
         file_hash: str,
         output_dir: str = "./received",
-        output_path: str | None = None,
-        preallocate: bool = True,
     ):
         self.filename = filename
         self.file_size = file_size
@@ -75,22 +65,16 @@ class ChunkReassembler:
         self.chunk_size = chunk_size
         self.expected_hash = file_hash
         self.output_dir = output_dir
-        self.output_path = output_path or os.path.join(output_dir, filename)
+        self.output_path = os.path.join(output_dir, filename)
 
         self._received: set[int] = set()
         self._lock = threading.Lock()
         self._bytes_written = 0
-        self._contiguous_next = 0
 
-        # Create parent directories (handles nested filenames like "subdir/video.mp4")
-        parent_dir = os.path.dirname(self.output_path)
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
-        else:
-            os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        # Pre-allocate the file
         with open(self.output_path, "wb") as f:
-            if preallocate:
-                f.truncate(file_size)
+            f.truncate(file_size)
 
     def add_chunk(self, chunk_id: int, data: bytes) -> bool:
         """Write chunk to correct offset. Returns True if new, False if dup."""
@@ -102,8 +86,6 @@ class ChunkReassembler:
                 f.write(data)
             self._received.add(chunk_id)
             self._bytes_written += len(data)
-            while self._contiguous_next in self._received:
-                self._contiguous_next += 1
             return True
 
     @property
@@ -123,47 +105,6 @@ class ChunkReassembler:
     @property
     def bytes_written(self) -> int:
         return self._bytes_written
-
-    @property
-    def contiguous_chunks(self) -> int:
-        return self._contiguous_next
-
-    @property
-    def contiguous_bytes(self) -> int:
-        if self._contiguous_next >= self.total_chunks:
-            return self.file_size
-        return min(self.file_size, self._contiguous_next * self.chunk_size)
-
-    def has_chunk_range(self, start_chunk: int, end_chunk: int) -> bool:
-        """Return True if every chunk in the inclusive range is available."""
-        with self._lock:
-            return all(i in self._received for i in range(start_chunk, end_chunk + 1))
-
-    def has_byte_range(self, start: int, end: int) -> bool:
-        """Return True if every chunk needed for byte range [start, end] exists."""
-        if start < 0 or end < start:
-            return False
-        start_chunk = start // self.chunk_size
-        end_chunk = min(self.total_chunks - 1, end // self.chunk_size)
-        return self.has_chunk_range(start_chunk, end_chunk)
-
-    def available_bytes_from(self, start: int, requested_end: int) -> int:
-        """Return readable bytes from start before the first missing chunk."""
-        if start < 0 or start >= self.file_size:
-            return 0
-
-        start_chunk = start // self.chunk_size
-        requested_end = min(self.file_size - 1, requested_end)
-        end_chunk = min(self.total_chunks - 1, requested_end // self.chunk_size)
-        with self._lock:
-            chunk = start_chunk
-            while chunk <= end_chunk and chunk in self._received:
-                chunk += 1
-
-        if chunk == start_chunk:
-            return 0
-        available_end = min(self.file_size - 1, chunk * self.chunk_size - 1, requested_end)
-        return max(0, available_end - start + 1)
 
     def missing_chunks(self) -> list[int]:
         """Return list of chunk IDs not yet received."""
