@@ -1,0 +1,26 @@
+# Runtime data produced by the receiver
+received/
+shared/
+
+# Python byte‑code / caches
+__pycache__/
+*.py[cod]
+
+# Virtual‑environment directories (if you use them)
+venv/
+env/
+.venv/
+
+# IDE / editor artefacts
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS‑specific files
+.DS_Store
+Thumbs.db
+
+# Log / temporary files
+*.log
+tmp/

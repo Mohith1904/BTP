@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiFi ↔ WiFi — Live Dashboard</title>
+    <link rel="stylesheet" href="style.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+    <!-- ── Top bar ─────────────────────────────────── -->
+    <header id="topbar">
+        <div class="logo">
+            <span class="logo-icon">⚡</span>
+            <span class="logo-text">LiFi ↔ WiFi</span>
+            <span class="logo-sub">Failover Dashboard</span>
+        </div>
+        <div class="status-pills">
+            <div class="pill" id="pill-interface">
+                <span class="pill-dot" id="dot-interface"></span>
+                <span id="label-interface">LiFi</span>
+            </div>
+            <div class="pill" id="pill-connection">
+                <span class="pill-dot dot-green"></span>
+                <span id="label-connection">Connected</span>
+            </div>
+            <div class="pill pill-neutral">
+                <span>⏱</span>
+                <span id="label-uptime">0s</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- ── Main grid ───────────────────────────────── -->
+    <main id="grid">
+        <!-- Left: File Browser -->
+        <section class="card" id="card-files">
+            <div class="card-header">
+                <h2>📂 Shared Files</h2>
+                <button id="btn-refresh" title="Refresh file list">↻</button>
+            </div>
+            <div class="card-body" id="file-list">
+                <p class="muted">Loading files…</p>
+            </div>
+        </section>
+
+        <!-- Right top: Active Transfers -->
+        <section class="card" id="card-transfers">
+            <div class="card-header">
+                <h2>📡 Active Transfers</h2>
+            </div>
+            <div class="card-body" id="transfer-list">
+                <p class="muted">No active transfers</p>
+            </div>
+        </section>
+
+        <!-- Right bottom: Stats -->
+        <section class="card" id="card-stats">
+            <div class="card-header">
+                <h2>📊 Statistics</h2>
+            </div>
+            <div class="card-body stats-grid">
+                <div class="stat">
+                    <span class="stat-value" id="stat-bytes">0 B</span>
+                    <span class="stat-label">Data Received</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="stat-chunks">0</span>
+                    <span class="stat-label">Chunks</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="stat-failovers">0</span>
+                    <span class="stat-label">Failovers</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="stat-bandwidth">—</span>
+                    <span class="stat-label">Bandwidth</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Bottom: Event Log -->
+        <section class="card" id="card-events">
+            <div class="card-header">
+                <h2>📋 Event Log</h2>
+            </div>
+            <div class="card-body" id="event-log">
+                <p class="muted">Waiting for events…</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- ── Video modal ─────────────────────────────── -->
+    <div id="video-modal" class="modal hidden">
+        <div class="modal-backdrop" onclick="closeModal()"></div>
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeModal()">✕</button>
+            <video id="video-player" controls autoplay>
+                Your browser does not support video playback.
+            </video>
+            <div id="video-status" class="video-status hidden">Buffering...</div>
+            <div id="video-title"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
