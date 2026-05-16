@@ -10,12 +10,12 @@ import os
 # ============================================================
 
 # Sender (Laptop A) IP addresses
-SENDER_LIFI_IP = "169.254.123.186"   # Ethernet IP (LiFi interface)
+SENDER_LIFI_IP = "169.254.99.107"   # Ethernet IP (LiFi interface)
 SENDER_WIFI_IP = "192.168.137.1"    # WiFi IP (Windows Mobile Hotspot host)
 
 # Receiver (Laptop B) IP addresses
-RECEIVER_LIFI_IP = "169.254.159.224" # Ethernet 2 IP (LiFi interface)
-RECEIVER_WIFI_IP = "192.168.137.116" # WiFi IP (connected to sender's hotspot)
+RECEIVER_LIFI_IP = "169.254.68.254" # Ethernet 2 IP (LiFi interface)
+RECEIVER_WIFI_IP = "192.168.137.42" # WiFi IP (connected to sender's hotspot)
 
 # ============================================================
 #  PORTS
@@ -39,7 +39,6 @@ RECV_BUFFER = 65536             # UDP receive buffer size
 # ============================================================
 SHARED_FOLDER = os.path.join(os.path.dirname(__file__), "shared")
 RECEIVE_FOLDER = os.path.join(os.path.dirname(__file__), "received")
-STREAM_CACHE_FOLDER = os.path.join(RECEIVE_FOLDER, ".stream_cache")
 
 # ============================================================
 #  DASHBOARD
@@ -47,29 +46,6 @@ STREAM_CACHE_FOLDER = os.path.join(RECEIVE_FOLDER, ".stream_cache")
 DASHBOARD_PORT = 8080
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 
-# ============================================================
-#  VIDEO STREAMING
-# ============================================================
-# The receiver now proxies HLS playlists and media segments, matching the
-# newer Hybrid WiFi/LiFi implementation. FFmpeg prepares the sender-side
-# playlist once, then the receiver asks for only the segments the player needs.
-FFMPEG_BIN = "ffmpeg"
-HLS_TIME_SECONDS = 4
-HLS_CACHE_FOLDER = os.path.join(os.path.dirname(__file__), ".hls_cache")
-STREAM_WAIT_TIMEOUT = 120.0
-
-# Legacy byte-range stream knobs are kept so old packet handlers fail gently if
-# an older client sends those control messages. The dashboard uses HLS now.
-STREAM_START_CHUNKS = 48
-STREAM_MIN_START_CHUNKS = 8
-STREAM_REQUEST_CHUNKS = 96
-STREAM_LOW_WATER_CHUNKS = 32
-STREAM_WINDOW_SECONDS = 20.0
-STREAM_START_SECONDS = 12.0
-FFPROBE_BIN = "ffprobe"
-
 # Create folders if they don't exist
 os.makedirs(SHARED_FOLDER, exist_ok=True)
 os.makedirs(RECEIVE_FOLDER, exist_ok=True)
-os.makedirs(STREAM_CACHE_FOLDER, exist_ok=True)
-os.makedirs(HLS_CACHE_FOLDER, exist_ok=True)

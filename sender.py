@@ -41,13 +41,17 @@ class Sender:
         self.active_transfers: dict[int, dict] = {}   # session_id -> state
         self.acked_chunks: dict[int, set] = {}         # session_id -> set of acked chunk_ids
         self._seq = 0
+        self._state_lock = threading.Lock()  # protects shared mutable state
 
         # ── heartbeat state ─────────────────────────────────
         self.hb_seq = 0
         self.last_hb_ack_time = time.time()
-        self.missed_hb = 0
         self.lifi_alive = True
         self.lifi_was_down = False
+
+        # ── switch synchronisation ──────────────────────────
+        self._switch_ack_event = threading.Event()
+        self._switchback_ack_event = threading.Event()
 
         # ── stats (for dashboard) ───────────────────────────
         self.stats = {
@@ -81,12 +85,12 @@ class Sender:
     def _on_ack(self, pkt: Packet, addr, iface):
         sid = pkt.session_id
         cid = pkt.chunk_id
-        if sid in self.acked_chunks:
-            self.acked_chunks[sid].add(cid)
+        with self._state_lock:
+            if sid in self.acked_chunks:
+                self.acked_chunks[sid].add(cid)
 
     def _on_heartbeat_ack(self, pkt: Packet, addr, iface):
         self.last_hb_ack_time = time.time()
-        self.missed_hb = 0
         if not self.lifi_alive:
             log.info("LiFi heartbeat restored!")
             self.lifi_alive = True
@@ -109,6 +113,13 @@ class Sender:
         filename = info.get("filename", "")
         filepath = os.path.join(config.SHARED_FOLDER, filename)
 
+        # Path traversal protection
+        root = os.path.abspath(config.SHARED_FOLDER)
+        resolved = os.path.abspath(filepath)
+        if not resolved.startswith(root + os.sep) and resolved != root:
+            log.error("Path traversal rejected: %s", filename)
+            return
+
         if not os.path.isfile(filepath):
             log.error("Requested file not found: %s", filename)
             return
@@ -120,9 +131,11 @@ class Sender:
 
     def _on_switch_ack(self, pkt: Packet, addr, iface):
         log.info("Receiver acknowledged switch to WiFi")
+        self._switch_ack_event.set()
 
     def _on_switchback_ack(self, pkt: Packet, addr, iface):
         log.info("Receiver acknowledged switch back to LiFi")
+        self._switchback_ack_event.set()
 
     # ── shared folder scanning ──────────────────────────────
     def _scan_shared_folder(self) -> list[dict]:
@@ -144,12 +157,13 @@ class Sender:
         meta = chunker.metadata()
         total = chunker.total_chunks
 
-        self.acked_chunks[session_id] = set()
-        self.active_transfers[session_id] = {
-            "filename": meta["filename"],
+        with self._state_lock:
+            self.acked_chunks[session_id] = set()
+            self.active_transfers[session_id] = {
+                "filename": meta["filename"],
             "total_chunks": total,
-            "started": time.time(),
-        }
+                "started": time.time(),
+            }
         self.stats["transfers"][session_id] = {
             "filename": meta["filename"],
             "progress": 0.0,
@@ -175,14 +189,19 @@ class Sender:
         unacked: dict[int, float] = {}   # chunk_id -> last_send_time
         retries: dict[int, int] = {}     # chunk_id -> retry_count
 
-        while len(self.acked_chunks[session_id]) < total:
+        while True:
+            with self._state_lock:
+                if len(self.acked_chunks[session_id]) >= total:
+                    break
             if not self.net.running:
                 return
 
             # Fill send window
             while (len(unacked) < config.WINDOW_SIZE
                    and next_chunk < total):
-                if next_chunk not in self.acked_chunks[session_id]:
+                with self._state_lock:
+                    already_acked = next_chunk in self.acked_chunks[session_id]
+                if not already_acked:
                     data = chunker.get_chunk(next_chunk)
                     pkt = Packet(
                         PType.DATA,
@@ -200,9 +219,10 @@ class Sender:
                 next_chunk += 1
 
             # Process acked chunks
-            for cid in list(unacked):
-                if cid in self.acked_chunks[session_id]:
-                    del unacked[cid]
+            with self._state_lock:
+                for cid in list(unacked):
+                    if cid in self.acked_chunks[session_id]:
+                        del unacked[cid]
 
             # Retransmit timed-out chunks
             now = time.time()
@@ -210,9 +230,10 @@ class Sender:
                 if now - send_time > config.ACK_TIMEOUT:
                     retries[cid] = retries.get(cid, 0) + 1
                     if retries[cid] > config.MAX_RETRIES:
-                        log.error("Chunk %d exceeded max retries", cid)
-                        unacked.pop(cid, None)
-                        continue
+                        # Keep transfer alive by clamping retry attempts and continuing.
+                        # This avoids silently dropping a required chunk forever.
+                        log.warning("Chunk %d exceeded max retries; continuing retransmit", cid)
+                        retries[cid] = config.MAX_RETRIES
                     data = chunker.get_chunk(cid)
                     pkt = Packet(
                         PType.DATA,
@@ -227,7 +248,8 @@ class Sender:
                     log.debug("Retransmit chunk %d (attempt %d)", cid, retries[cid])
 
             # Update stats
-            acked_count = len(self.acked_chunks[session_id])
+            with self._state_lock:
+                acked_count = len(self.acked_chunks[session_id])
             self.stats["transfers"][session_id]["progress"] = acked_count / total
             self.stats["transfers"][session_id]["interface"] = self.net.active_interface
 
@@ -237,12 +259,16 @@ class Sender:
         done = Packet(PType.TRANSFER_COMPLETE, seq_num=self._next_seq(), session_id=session_id)
         self.net.send_ctrl(done)
         self.net.send_ctrl(done, interface="wifi")  # send on both to be sure
-        elapsed = time.time() - self.active_transfers[session_id]["started"]
-        log.info("Transfer complete: %s in %.1fs", meta["filename"], elapsed)
-        del self.active_transfers[session_id]
+        with self._state_lock:
+            elapsed = time.time() - self.active_transfers[session_id]["started"]
+            log.info("Transfer complete: %s in %.1fs", meta["filename"], elapsed)
+            del self.active_transfers[session_id]
+            self.acked_chunks.pop(session_id, None)  # cleanup to prevent memory leak
 
     # ── heartbeat ───────────────────────────────────────────
     def _heartbeat_loop(self):
+        """Time-only heartbeat detection: failover when no ACK received within timeout."""
+        hb_timeout = config.HEARTBEAT_INTERVAL * config.MAX_MISSED_HEARTBEATS
         while self.net.running:
             self.hb_seq += 1
             pkt = Packet(PType.HEARTBEAT, seq_num=self.hb_seq)
@@ -250,42 +276,47 @@ class Sender:
 
             time.sleep(config.HEARTBEAT_INTERVAL)
 
-            # Check for missed heartbeats
             elapsed = time.time() - self.last_hb_ack_time
-            if elapsed > config.HEARTBEAT_INTERVAL * config.MAX_MISSED_HEARTBEATS:
+            if elapsed > hb_timeout:
                 if self.lifi_alive:
-                    self.missed_hb += 1
-                    if self.missed_hb >= config.MAX_MISSED_HEARTBEATS:
-                        self.lifi_alive = False
-                        self.lifi_was_down = True
-                        log.warning("LiFi DOWN — %d heartbeats missed", self.missed_hb)
-                        self._initiate_failover()
+                    self.lifi_alive = False
+                    self.lifi_was_down = True
+                    log.warning("LiFi DOWN — no heartbeat ACK for %.1fs", elapsed)
+                    self._initiate_failover()
             else:
                 if self.lifi_was_down and self.lifi_alive:
                     self._initiate_switchback()
                     self.lifi_was_down = False
 
     def _initiate_failover(self):
-        """Switch data transfer to WiFi."""
+        """Switch data transfer to WiFi — waits for receiver ACK."""
         log.warning(">>> FAILOVER: LiFi → WiFi <<<")
         self.stats["failover_count"] += 1
         self.stats["active_interface"] = "wifi"
 
-        # Notify receiver to switch
+        # Notify receiver and wait for acknowledgment
+        self._switch_ack_event.clear()
         payload = Packet.make_json_payload({"interface": "wifi"})
         notify = Packet(PType.SWITCH_NOTIFY, seq_num=self._next_seq(), payload=payload)
         self.net.send_ctrl(notify, interface="wifi")
 
+        if not self._switch_ack_event.wait(timeout=1.0):
+            log.warning("No SWITCH_ACK from receiver — switching anyway")
+
         self.net.switch_to("wifi")
 
     def _initiate_switchback(self):
-        """Switch data transfer back to LiFi."""
+        """Switch data transfer back to LiFi — waits for receiver ACK."""
         log.info(">>> SWITCH BACK: WiFi → LiFi <<<")
         self.stats["active_interface"] = "lifi"
 
+        self._switchback_ack_event.clear()
         payload = Packet.make_json_payload({"interface": "lifi"})
         notify = Packet(PType.SWITCH_BACK, seq_num=self._next_seq(), payload=payload)
         self.net.send_ctrl(notify, interface="wifi")  # Send over wifi since lifi just recovered
+
+        if not self._switchback_ack_event.wait(timeout=1.0):
+            log.warning("No SWITCH_BACK_ACK from receiver — switching anyway")
 
         self.net.switch_to("lifi")
 

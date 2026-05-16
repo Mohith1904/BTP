@@ -132,6 +132,12 @@ class Receiver:
     def _on_file_meta(self, pkt: Packet, addr, iface):
         meta = pkt.json_payload()
         sid = pkt.session_id
+
+        # Ignore duplicate FILE_META for an already-active session
+        if sid in self.reassemblers:
+            log.info("Duplicate FILE_META for session %d ignored", sid)
+            return
+
         log.info("Receiving file: %s (%d chunks, %d bytes)",
                  meta["filename"], meta["total_chunks"], meta["file_size"])
 
@@ -168,21 +174,51 @@ class Receiver:
     def _on_transfer_complete(self, pkt: Packet, addr, iface):
         sid = pkt.session_id
         reassembler = self.reassemblers.get(sid)
-        if reassembler:
-            if reassembler.is_complete:
-                ok = reassembler.verify()
-                status = "VERIFIED ✓" if ok else "HASH MISMATCH ✗"
-                log.info("Transfer complete: %s — %s", reassembler.filename, status)
-                self._add_event(f"Complete: {reassembler.filename} ({status})")
-            else:
-                missing = len(reassembler.missing_chunks())
-                log.warning("Transfer ended but %d chunks missing!", missing)
-                self._add_event(f"Incomplete: {reassembler.filename} ({missing} missing)")
-
+        if not reassembler:
+            return  # already handled or unknown session
+        if reassembler.is_complete:
+            ok = reassembler.verify()
+            status = "VERIFIED ✓" if ok else "HASH MISMATCH ✗"
+            log.info("Transfer complete: %s — %s", reassembler.filename, status)
+            self._add_event(f"Complete: {reassembler.filename} ({status})")
             with self._stats_lock:
                 if sid in self.stats["transfers"]:
                     self.stats["transfers"][sid]["completed"] = True
                     self.stats["transfers"][sid]["progress"] = reassembler.progress
+            self.reassemblers.pop(sid, None)
+        else:
+            # Grace period: wait for late UDP packets before giving up
+            missing = len(reassembler.missing_chunks())
+            log.warning("TRANSFER_COMPLETE received but %d chunks missing — waiting for late packets...", missing)
+            threading.Thread(
+                target=self._grace_period_cleanup,
+                args=(sid, missing),
+                daemon=True,
+            ).start()
+
+    def _grace_period_cleanup(self, sid: int, initial_missing: int):
+        """Wait up to 2 seconds for late packets, then finalize the transfer."""
+        time.sleep(2.0)
+        reassembler = self.reassemblers.get(sid)
+        if not reassembler:
+            return  # already cleaned up
+
+        if reassembler.is_complete:
+            ok = reassembler.verify()
+            status = "VERIFIED ✓" if ok else "HASH MISMATCH ✗"
+            log.info("Transfer completed after grace period: %s — %s", reassembler.filename, status)
+            self._add_event(f"Complete (late): {reassembler.filename} ({status})")
+        else:
+            still_missing = len(reassembler.missing_chunks())
+            log.warning("Transfer incomplete after grace period: %s (%d chunks still missing)",
+                        reassembler.filename, still_missing)
+            self._add_event(f"Incomplete: {reassembler.filename} ({still_missing} missing)")
+
+        with self._stats_lock:
+            if sid in self.stats["transfers"]:
+                self.stats["transfers"][sid]["completed"] = True
+                self.stats["transfers"][sid]["progress"] = reassembler.progress
+        self.reassemblers.pop(sid, None)
 
     def _on_switch_notify(self, pkt: Packet, addr, iface):
         info = pkt.json_payload()
@@ -284,12 +320,30 @@ class Receiver:
             def _serve_stream(self, filename):
                 """Serve a file from received folder (supports Range requests for video)."""
                 filepath = os.path.join(config.RECEIVE_FOLDER, filename)
+
+                # Path traversal protection
+                root = os.path.abspath(config.RECEIVE_FOLDER)
+                resolved = os.path.abspath(filepath)
+                if not resolved.startswith(root + os.sep) and resolved != root:
+                    self.send_error(403, "Path traversal rejected")
+                    return
+
                 if not os.path.exists(filepath):
                     self.send_error(404, "File not found")
                     return
 
                 file_size = os.path.getsize(filepath)
                 content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                available_size = file_size
+                is_complete = True
+                for reassembler in self.receiver.reassemblers.values():
+                    if reassembler.filename == filename:
+                        available_size = reassembler.contiguous_bytes
+                        is_complete = reassembler.is_complete
+                        break
+                if not is_complete and available_size <= 0:
+                    self.send_error(503, "File transfer in progress; no bytes available yet")
+                    return
 
                 range_header = self.headers.get("Range")
                 if range_header:
@@ -298,7 +352,15 @@ class Receiver:
                     parts = range_str.split("-")
                     start = int(parts[0]) if parts[0] else 0
                     end = int(parts[1]) if parts[1] else file_size - 1
-                    end = min(end, file_size - 1)
+                    max_end = (file_size - 1) if is_complete else (available_size - 1)
+                    if start > max_end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{file_size}")
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
+                    end = min(end, max_end)
                     length = end - start + 1
 
                     self.send_response(206)
@@ -313,19 +375,29 @@ class Receiver:
                         f.seek(start)
                         self.wfile.write(f.read(length))
                 else:
-                    self.send_response(200)
+                    # For in-progress files, only expose contiguous bytes so players can stream
+                    # without reading zero-filled preallocated tail data.
+                    if is_complete:
+                        self.send_response(200)
+                        body_len = file_size
+                    else:
+                        self.send_response(206)
+                        body_len = available_size
+                        self.send_header("Content-Range", f"bytes 0-{max(0, body_len - 1)}/{file_size}")
                     self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", file_size)
+                    self.send_header("Content-Length", body_len)
                     self.send_header("Accept-Ranges", "bytes")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
 
                     with open(filepath, "rb") as f:
-                        while True:
-                            chunk = f.read(65536)
+                        remaining = body_len
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
                             if not chunk:
                                 break
                             self.wfile.write(chunk)
+                            remaining -= len(chunk)
 
             def _sse_stream(self):
                 """Server-Sent Events stream for real-time dashboard updates."""

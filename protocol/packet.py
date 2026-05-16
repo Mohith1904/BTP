@@ -124,6 +124,10 @@ class Packet:
 
         if magic != MAGIC:
             raise ValueError("Invalid magic bytes")
+        if _ver != VERSION:
+            raise ValueError(f"Unsupported protocol version: {_ver}")
+        if len(body) < HEADER_SIZE + plen:
+            raise ValueError(f"Payload length mismatch: header says {plen}, but only {len(body) - HEADER_SIZE} bytes available")
 
         payload = body[HEADER_SIZE: HEADER_SIZE + plen]
         return cls(

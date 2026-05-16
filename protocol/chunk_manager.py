@@ -70,8 +70,14 @@ class ChunkReassembler:
         self._received: set[int] = set()
         self._lock = threading.Lock()
         self._bytes_written = 0
+        self._contiguous_next = 0
 
-        os.makedirs(output_dir, exist_ok=True)
+        # Create parent directories (handles nested filenames like "subdir/video.mp4")
+        parent_dir = os.path.dirname(self.output_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        else:
+            os.makedirs(output_dir, exist_ok=True)
         # Pre-allocate the file
         with open(self.output_path, "wb") as f:
             f.truncate(file_size)
@@ -86,6 +92,8 @@ class ChunkReassembler:
                 f.write(data)
             self._received.add(chunk_id)
             self._bytes_written += len(data)
+            while self._contiguous_next in self._received:
+                self._contiguous_next += 1
             return True
 
     @property
@@ -105,6 +113,16 @@ class ChunkReassembler:
     @property
     def bytes_written(self) -> int:
         return self._bytes_written
+
+    @property
+    def contiguous_chunks(self) -> int:
+        return self._contiguous_next
+
+    @property
+    def contiguous_bytes(self) -> int:
+        if self._contiguous_next >= self.total_chunks:
+            return self.file_size
+        return min(self.file_size, self._contiguous_next * self.chunk_size)
 
     def missing_chunks(self) -> list[int]:
         """Return list of chunk IDs not yet received."""

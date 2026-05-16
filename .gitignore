@@ -1,6 +1,5 @@
 # Runtime data produced by the receiver
 received/
-shared/
 
 # Python byte‑code / caches
 __pycache__/
