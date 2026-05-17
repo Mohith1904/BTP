@@ -273,11 +273,24 @@ class Sender:
         stream_sid = info.get("stream_session_id", 0)
 
         session = self.stream_sessions.pop(stream_sid, None)
-        if session:
+        if not session:
+            log.debug("Stream close for unknown session %d", stream_sid)
+            return
+
+        log.info("Stream session %d closing: %s", stream_sid, session.filename)
+
+        # Defer cleanup: wait for any in-flight segment transfers to finish
+        # before deleting the HLS temp files they're reading from.
+        def _deferred_cleanup():
+            for _ in range(60):  # poll for up to 30 seconds
+                active = any(sid == stream_sid for sid, _ in self._active_seg_transfers)
+                if not active:
+                    break
+                time.sleep(0.5)
             session.cleanup()
             log.info("Stream session %d closed: %s", stream_sid, session.filename)
-        else:
-            log.debug("Stream close for unknown session %d", stream_sid)
+
+        threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
     # ── shared folder scanning ──────────────────────────────
     def _scan_shared_folder(self) -> list[dict]:
