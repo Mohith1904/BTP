@@ -728,6 +728,19 @@ class Receiver:
         class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
             daemon_threads = True
 
+            def handle_error(self, request, client_address):
+                """Suppress noisy but harmless connection aborts.
+
+                Browsers often open speculative connections and close them
+                before sending a request (preflight, favicon, etc.).
+                """
+                import sys
+                exc_type = sys.exc_info()[0]
+                if exc_type in (ConnectionAbortedError, ConnectionResetError,
+                                BrokenPipeError, OSError):
+                    return  # silently ignore
+                super().handle_error(request, client_address)
+
         server = ThreadedHTTPServer(("0.0.0.0", config.DASHBOARD_PORT), DashboardHandler)
         log.info("Dashboard: http://localhost:%d", config.DASHBOARD_PORT)
         try:

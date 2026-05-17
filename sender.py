@@ -46,6 +46,8 @@ class Sender:
 
         # ── streaming state ─────────────────────────────────
         self.stream_sessions: dict[int, SenderStreamSession] = {}
+        self._stream_preparing: set[str] = set()  # filenames currently being prepared
+        self._active_seg_transfers: set[tuple] = set()  # (stream_sid, seg_index) in flight
 
         # ── heartbeat state ─────────────────────────────────
         self.hb_seq = 0
@@ -168,39 +170,52 @@ class Sender:
             log.error("Stream: unsupported extension %s for: %s", ext, filename)
             return
 
+        # Deduplicate: if we're already preparing or streaming this file, skip
+        if filename in self._stream_preparing:
+            log.debug("Stream: duplicate request for %s ignored (already preparing)", filename)
+            return
+        for s in self.stream_sessions.values():
+            if s.filename == os.path.basename(filename):
+                log.debug("Stream: duplicate request for %s ignored (already active)", filename)
+                return
+
+        self._stream_preparing.add(filename)
         log.info("Stream request: %s (via %s)", filename, iface)
         session_id = random.randint(1, 0xFFFFFFFF)
 
         # Run HLS segmentation in a background thread
         def _prepare_and_send_meta():
-            session = SenderStreamSession(
-                session_id=session_id,
-                filepath=filepath,
-                hls_cache_dir=config.HLS_CACHE_DIR,
-                ffmpeg_path=config.FFMPEG_PATH,
-                ffprobe_path=config.FFPROBE_PATH,
-                segment_duration=config.HLS_SEGMENT_DURATION,
-            )
-            if not session.prepare_hls():
-                log.error("Stream: ffmpeg HLS segmentation failed for %s", filename)
-                log.error("Ensure the video uses H.264/AAC codecs. "
-                          "Re-encode with: ffmpeg -i input -c:v libx264 -c:a aac output.mp4")
-                return
+            try:
+                session = SenderStreamSession(
+                    session_id=session_id,
+                    filepath=filepath,
+                    hls_cache_dir=config.HLS_CACHE_DIR,
+                    ffmpeg_path=config.FFMPEG_PATH,
+                    ffprobe_path=config.FFPROBE_PATH,
+                    segment_duration=config.HLS_SEGMENT_DURATION,
+                )
+                if not session.prepare_hls():
+                    log.error("Stream: ffmpeg HLS segmentation failed for %s", filename)
+                    log.error("Ensure the video uses H.264/AAC codecs. "
+                              "Re-encode with: ffmpeg -i input -c:v libx264 -c:a aac output.mp4")
+                    return
 
-            self.stream_sessions[session_id] = session
+                self.stream_sessions[session_id] = session
 
-            # Send STREAM_META to receiver (on both interfaces)
-            meta_payload = Packet.make_json_payload(session.get_stream_meta_payload())
-            meta_pkt = Packet(
-                PType.STREAM_META,
-                seq_num=self._next_seq(),
-                session_id=session_id,
-                payload=meta_payload,
-            )
-            self.net.send_ctrl(meta_pkt, interface="lifi")
-            self.net.send_ctrl(meta_pkt, interface="wifi")
-            log.info("Stream session %d ready: %s (%d segments)",
-                     session_id, filename, session.segment_count)
+                # Send STREAM_META to receiver (on both interfaces)
+                meta_payload = Packet.make_json_payload(session.get_stream_meta_payload())
+                meta_pkt = Packet(
+                    PType.STREAM_META,
+                    seq_num=self._next_seq(),
+                    session_id=session_id,
+                    payload=meta_payload,
+                )
+                self.net.send_ctrl(meta_pkt, interface="lifi")
+                self.net.send_ctrl(meta_pkt, interface="wifi")
+                log.info("Stream session %d ready: %s (%d segments)",
+                         session_id, filename, session.segment_count)
+            finally:
+                self._stream_preparing.discard(filename)
 
         t = threading.Thread(target=_prepare_and_send_meta, daemon=True)
         t.start()
@@ -209,6 +224,13 @@ class Sender:
         info = pkt.json_payload()
         stream_sid = info.get("stream_session_id", 0)
         seg_index = info.get("segment_index", 0)
+
+        # Deduplicate: skip if this segment is already being transferred
+        seg_key = (stream_sid, seg_index)
+        if seg_key in self._active_seg_transfers:
+            log.debug("Stream segment %d for session %d already in flight, skipping",
+                      seg_index, stream_sid)
+            return
 
         session = self.stream_sessions.get(stream_sid)
         if not session:
@@ -224,23 +246,26 @@ class Sender:
         # without conflicting with file downloads or other segments
         transfer_sid = stream_sid ^ ((seg_index + 0x10000) & 0xFFFFFFFF)
 
+        self._active_seg_transfers.add(seg_key)
         log.debug("Sending stream segment %d for session %d (transfer_sid=%d)",
                   seg_index, stream_sid, transfer_sid)
 
         # Send the segment using the existing _send_file mechanism.
         # We pass extra metadata so the receiver knows this is a streaming segment.
-        t = threading.Thread(
-            target=self._send_file,
-            args=(seg_path, transfer_sid),
-            kwargs={
-                "stream_meta": {
-                    "is_stream_segment": True,
-                    "stream_session_id": stream_sid,
-                    "segment_index": seg_index,
-                },
-            },
-            daemon=True,
-        )
+        def _send_and_cleanup():
+            try:
+                self._send_file(
+                    seg_path, transfer_sid,
+                    stream_meta={
+                        "is_stream_segment": True,
+                        "stream_session_id": stream_sid,
+                        "segment_index": seg_index,
+                    },
+                )
+            finally:
+                self._active_seg_transfers.discard(seg_key)
+
+        t = threading.Thread(target=_send_and_cleanup, daemon=True)
         t.start()
 
     def _on_stream_close(self, pkt: Packet, addr, iface):
@@ -380,9 +405,13 @@ class Sender:
         self.net.send_ctrl(done)
         self.net.send_ctrl(done, interface="wifi")  # send on both to be sure
         with self._state_lock:
-            elapsed = time.time() - self.active_transfers[session_id]["started"]
-            log.info("Transfer complete: %s in %.1fs", meta["filename"], elapsed)
-            del self.active_transfers[session_id]
+            transfer_info = self.active_transfers.get(session_id)
+            if transfer_info:
+                elapsed = time.time() - transfer_info["started"]
+                log.info("Transfer complete: %s in %.1fs", meta["filename"], elapsed)
+                del self.active_transfers[session_id]
+            else:
+                log.info("Transfer complete: %s", meta["filename"])
             self.acked_chunks.pop(session_id, None)  # cleanup to prevent memory leak
 
     # ── heartbeat ───────────────────────────────────────────
