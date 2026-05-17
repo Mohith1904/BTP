@@ -46,6 +46,31 @@ RECEIVE_FOLDER = os.path.join(os.path.dirname(__file__), "received")
 DASHBOARD_PORT = 8080
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 
+# ============================================================
+#  HLS STREAMING — Configurable parameters
+# ============================================================
+# Each HLS segment is a time-based slice of the video.
+# At 1080p ~5 Mbps, a 4-second segment ≈ 2.5 MB on disk.
+# The segment is then transferred over UDP in CHUNK_SIZE (60 KB) pieces.
+
+HLS_SEGMENT_DURATION = 4        # seconds per HLS segment (must be integer)
+HLS_BUFFER_BEHIND = 7           # keep N segments behind current playback
+HLS_BUFFER_AHEAD = 17           # pre-fetch N segments ahead of playback
+HLS_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".hls_cache")
+STREAM_SEGMENT_TIMEOUT = 10     # max seconds to wait for a segment from sender
+FFMPEG_PATH = "ffmpeg"          # full path if not in system PATH
+FFPROBE_PATH = "ffprobe"        # full path if not in system PATH
+
+# Supported video extensions for streaming.
+# Only H.264 video + AAC audio in MP4/TS containers are guaranteed
+# to work with HLS browser playback (hls.js).
+# VLC supports almost all codecs natively.
+# If ffmpeg fails with -codec copy, the file likely uses an
+# incompatible codec (HEVC/VP9/AV1) — re-encode it manually:
+#   ffmpeg -i input.mkv -c:v libx264 -crf 23 -c:a aac output.mp4
+STREAM_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"}
+
 # Create folders if they don't exist
 os.makedirs(SHARED_FOLDER, exist_ok=True)
 os.makedirs(RECEIVE_FOLDER, exist_ok=True)
+os.makedirs(HLS_CACHE_DIR, exist_ok=True)

@@ -174,6 +174,29 @@ body::before {
     background: var(--accent);
     color: #fff;
 }
+.file-actions {
+    display: flex; gap: .4rem; flex-shrink: 0;
+}
+.stream-btn {
+    border-color: var(--lifi) !important;
+    color: var(--lifi) !important;
+}
+.stream-btn:hover {
+    background: var(--lifi) !important;
+    color: #000 !important;
+}
+.stream-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.download-btn {
+    border-color: var(--text-muted) !important;
+    color: var(--text-muted) !important;
+}
+.download-btn:hover {
+    background: var(--text-muted) !important;
+    color: var(--bg) !important;
+}
 
 /* ── Transfer items ────────────────────────────── */
 .transfer-item {
@@ -238,6 +261,7 @@ body::before {
 .event-msg.failover { color: var(--wifi); font-weight: 600; }
 .event-msg.switchback { color: var(--lifi); font-weight: 600; }
 .event-msg.complete { color: var(--success); }
+.event-msg.stream { color: var(--lifi); }
 
 .muted { color: var(--text-muted); font-size: .85rem; font-style: italic; }
 
@@ -272,7 +296,7 @@ body::before {
 .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.8); }
 .modal-content {
     position: relative;
-    width: 80vw; max-width: 900px;
+    width: 85vw; max-width: 1000px;
     border-radius: var(--radius);
     overflow: hidden;
     background: #111;
@@ -284,12 +308,69 @@ body::before {
     width: 32px; height: 32px; border-radius: 50%;
     cursor: pointer; font-size: 1rem; z-index: 10;
     display: flex; align-items: center; justify-content: center;
+    transition: background .2s;
 }
-#video-player { width: 100%; display: block; }
+.modal-close:hover { background: rgba(255,68,102,0.6); }
+#video-player { width: 100%; display: block; max-height: 70vh; }
 #video-title {
     padding: .6rem 1rem;
-    font-size: .85rem; color: var(--text-muted);
+    font-size: .9rem; font-weight: 600; color: var(--text);
     background: rgba(0,0,0,0.4);
+}
+
+/* ── Stream info panel ────────────────────────── */
+.stream-info {
+    padding: .8rem 1rem;
+    background: rgba(0,0,0,0.5);
+    border-top: 1px solid var(--border);
+}
+.stream-info.hidden { display: none; }
+
+.vlc-url-bar {
+    display: flex; align-items: center; gap: .6rem;
+    margin-bottom: .6rem;
+}
+.vlc-label {
+    font-size: .8rem; font-weight: 600; color: var(--text-muted);
+    white-space: nowrap;
+}
+.vlc-url-bar input {
+    flex: 1;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: .4rem .7rem;
+    color: var(--lifi);
+    font-family: 'Inter', monospace;
+    font-size: .78rem;
+    outline: none;
+}
+.vlc-url-bar input:focus {
+    border-color: var(--lifi);
+    box-shadow: 0 0 8px var(--lifi-glow);
+}
+#btn-copy-vlc {
+    padding: .35rem .7rem;
+    border-radius: 8px;
+    font-size: .75rem; font-weight: 600;
+    border: 1px solid var(--lifi);
+    color: var(--lifi);
+    background: transparent;
+    cursor: pointer;
+    transition: all .2s ease;
+    white-space: nowrap;
+}
+#btn-copy-vlc:hover {
+    background: var(--lifi);
+    color: #000;
+}
+
+.stream-meta {
+    display: flex; gap: 1.2rem;
+    font-size: .78rem; color: var(--text-muted);
+}
+.stream-meta span {
+    display: flex; align-items: center; gap: .3rem;
 }
 
 /* ── Responsive ────────────────────────────────── */
@@ -302,4 +383,6 @@ body::before {
     #card-transfers { grid-column: 1; }
     #card-stats     { grid-column: 1; }
     #card-events    { grid-column: 1; }
+    .modal-content  { width: 95vw; }
+    .vlc-url-bar    { flex-wrap: wrap; }
 }

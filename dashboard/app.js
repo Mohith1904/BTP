@@ -2,6 +2,8 @@
 let currentInterface = "lifi";
 let lastBytes = 0;
 let lastTime = Date.now();
+let currentHls = null;         // hls.js instance
+let currentStreamSessionId = null;
 
 // ── DOM refs ──────────────────────────────────────
 const dotIface    = document.getElementById("dot-interface");
@@ -32,6 +34,15 @@ function formatTime(secs) {
     if (m < 60) return m + "m " + s + "s";
     const h = Math.floor(m / 60);
     return h + "h " + (m % 60) + "m";
+}
+
+function formatDuration(secs) {
+    secs = Math.floor(secs);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    return `${m}:${String(s).padStart(2,'0')}`;
 }
 
 function fileIcon(ext) {
@@ -73,18 +84,22 @@ function renderFiles(files) {
         fileListEl.innerHTML = '<p class="muted">No files shared yet. Place files in the sender\'s <code>shared/</code> folder.</p>';
         return;
     }
-    fileListEl.innerHTML = files.map(f => `
+    fileListEl.innerHTML = files.map(f => {
+        const isVid = isVideo(f.ext);
+        return `
         <div class="file-item" data-name="${f.name}" data-ext="${f.ext}">
             <div class="file-icon">${fileIcon(f.ext)}</div>
             <div class="file-info">
                 <div class="file-name" title="${f.name}">${f.name}</div>
                 <div class="file-size">${formatBytes(f.size)}</div>
             </div>
-            <button class="file-action" onclick="requestFile('${f.name}', '${f.ext}')">
-                ${isVideo(f.ext) ? '▶ Stream' : '⬇ Download'}
-            </button>
+            <div class="file-actions">
+                ${isVid ? `<button class="file-action stream-btn" onclick="startStream('${f.name}')">▶ Stream</button>` : ''}
+                <button class="file-action download-btn" onclick="requestFile('${f.name}', '${f.ext}')">⬇ Download</button>
+            </div>
         </div>
-    `).join("");
+        `;
+    }).join("");
 }
 
 async function refreshFiles() {
@@ -98,33 +113,149 @@ async function refreshFiles() {
 }
 document.getElementById("btn-refresh").addEventListener("click", refreshFiles);
 
-// ── Request file / stream video ───────────────────
+// ── Download file ─────────────────────────────────
 async function requestFile(name, ext) {
     try {
         await fetch(`/api/download/${encodeURIComponent(name)}`, { method: "POST" });
-        if (isVideo(ext)) {
-            // Wait a moment for chunks to start arriving, then open video player
-            setTimeout(() => openVideoModal(name), 1500);
-        }
     } catch (e) {
-        console.error("Request failed:", e);
+        console.error("Download request failed:", e);
     }
 }
 
-function openVideoModal(name) {
+// ── HLS Streaming ─────────────────────────────────
+async function startStream(name) {
+    const streamBtn = document.querySelector(`.file-item[data-name="${name}"] .stream-btn`);
+    if (streamBtn) {
+        streamBtn.disabled = true;
+        streamBtn.textContent = "⏳ Preparing...";
+    }
+
+    try {
+        const r = await fetch(`/api/stream_start/${encodeURIComponent(name)}`, { method: "POST" });
+        if (!r.ok) {
+            alert("Stream failed. Check sender logs.\n\nPossible causes:\n• Video codec not compatible (needs H.264/AAC)\n• ffmpeg not installed on sender\n• File not found");
+            return;
+        }
+        const data = await r.json();
+        openStreamModal(data);
+    } catch (e) {
+        console.error("Stream start failed:", e);
+        alert("Failed to start stream: " + e.message);
+    } finally {
+        if (streamBtn) {
+            streamBtn.disabled = false;
+            streamBtn.textContent = "▶ Stream";
+        }
+    }
+}
+
+function openStreamModal(streamData) {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
     const title = document.getElementById("video-title");
-    player.src = `/api/stream/${encodeURIComponent(name)}`;
-    title.textContent = name;
+    const streamInfo = document.getElementById("stream-info");
+    const vlcInput = document.getElementById("vlc-url");
+    const metaInfo = document.getElementById("stream-meta-info");
+
+    currentStreamSessionId = streamData.session_id;
+    const hlsUrl = `/api/hls/${streamData.session_id}/playlist.m3u8`;
+    const vlcUrl = streamData.vlc_url || `http://localhost:${location.port}/api/hls/${streamData.session_id}/playlist.m3u8`;
+
+    title.textContent = streamData.filename;
+    vlcInput.value = vlcUrl;
+    streamInfo.classList.remove("hidden");
+
+    // Show metadata
+    const res = streamData.width && streamData.height ? `${streamData.width}×${streamData.height}` : "—";
+    const dur = streamData.duration ? formatDuration(streamData.duration) : "—";
+    const segs = streamData.segment_count || "—";
+    metaInfo.innerHTML = `
+        <span>📐 ${res}</span>
+        <span>⏱ ${dur}</span>
+        <span>🧩 ${segs} segments</span>
+    `;
+
+    // Initialize HLS player
+    if (Hls.isSupported()) {
+        if (currentHls) {
+            currentHls.destroy();
+        }
+        currentHls = new Hls({
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            maxBufferSize: 60 * 1024 * 1024,
+            enableWorker: true,
+        });
+        currentHls.loadSource(hlsUrl);
+        currentHls.attachMedia(player);
+        currentHls.on(Hls.Events.MANIFEST_PARSED, () => {
+            player.play().catch(() => {});
+        });
+        currentHls.on(Hls.Events.ERROR, (event, data) => {
+            console.warn("HLS error:", data.type, data.details);
+            if (data.fatal) {
+                switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        console.log("Network error, retrying...");
+                        currentHls.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        console.log("Media error, recovering...");
+                        currentHls.recoverMediaError();
+                        break;
+                    default:
+                        console.error("Fatal HLS error, destroying...");
+                        currentHls.destroy();
+                        break;
+                }
+            }
+        });
+    } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS
+        player.src = hlsUrl;
+        player.addEventListener('loadedmetadata', () => player.play());
+    } else {
+        alert("HLS playback is not supported in this browser. Use VLC instead:\n\n" + vlcUrl);
+    }
+
     modal.classList.remove("hidden");
 }
+
 function closeModal() {
     const modal = document.getElementById("video-modal");
     const player = document.getElementById("video-player");
+    const streamInfo = document.getElementById("stream-info");
+
     player.pause();
     player.src = "";
+
+    if (currentHls) {
+        currentHls.destroy();
+        currentHls = null;
+    }
+
+    // Close the streaming session on the server
+    if (currentStreamSessionId) {
+        fetch(`/api/stream_close/${currentStreamSessionId}`, { method: "POST" }).catch(() => {});
+        currentStreamSessionId = null;
+    }
+
+    streamInfo.classList.add("hidden");
     modal.classList.add("hidden");
+}
+
+function copyVlcUrl() {
+    const vlcInput = document.getElementById("vlc-url");
+    vlcInput.select();
+    navigator.clipboard.writeText(vlcInput.value).then(() => {
+        const btn = document.getElementById("btn-copy-vlc");
+        const orig = btn.textContent;
+        btn.textContent = "✓ Copied!";
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+    }).catch(() => {
+        // Fallback for older browsers
+        document.execCommand("copy");
+    });
 }
 
 // ── Transfers ─────────────────────────────────────
@@ -168,6 +299,7 @@ function renderEvents(events) {
         if (e.msg.includes("Failover")) cls = "failover";
         else if (e.msg.includes("Switch back")) cls = "switchback";
         else if (e.msg.includes("Complete") || e.msg.includes("VERIFIED")) cls = "complete";
+        else if (e.msg.includes("Stream")) cls = "stream";
         return `
             <div class="event">
                 <span class="event-time">${e.time}</span>

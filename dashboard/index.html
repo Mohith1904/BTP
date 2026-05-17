@@ -6,6 +6,7 @@
     <title>LiFi ↔ WiFi — Live Dashboard</title>
     <link rel="stylesheet" href="style.css" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 </head>
 <body>
     <!-- ── Top bar ─────────────────────────────────── -->
@@ -90,7 +91,7 @@
         </section>
     </main>
 
-    <!-- ── Video modal ─────────────────────────────── -->
+    <!-- ── Video/Stream modal ────────────────────────── -->
     <div id="video-modal" class="modal hidden">
         <div class="modal-backdrop" onclick="closeModal()"></div>
         <div class="modal-content">
@@ -99,6 +100,14 @@
                 Your browser does not support video playback.
             </video>
             <div id="video-title"></div>
+            <div id="stream-info" class="stream-info hidden">
+                <div class="vlc-url-bar">
+                    <span class="vlc-label">🎬 VLC URL:</span>
+                    <input type="text" id="vlc-url" readonly />
+                    <button id="btn-copy-vlc" onclick="copyVlcUrl()" title="Copy VLC URL">📋 Copy</button>
+                </div>
+                <div class="stream-meta" id="stream-meta-info"></div>
+            </div>
         </div>
     </div>
 

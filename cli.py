@@ -9,6 +9,9 @@ Usage:
 Commands:
     list / ls           — List files available on the sender
     get <filename>      — Request download of a file
+    stream <filename>   — Stream a video file (HLS)
+    streams             — Show active streaming sessions
+    close <session_id>  — Close a streaming session
     status / st         — Show active transfers and progress
     events              — Show recent event log
     help / ?            — Show this help
@@ -187,18 +190,102 @@ def cmd_events():
 
 def cmd_help():
     print("""
-  ┌─────────────────────────────────────────────────┐
-  │         LiFi-WiFi Receiver CLI                  │
-  ├────────────────┬────────────────────────────────┤
-  │  list, ls      │  List files on the sender      │
-  │  get <file>    │  Download a file               │
-  │  status, st    │  Show transfer progress        │
-  │  events        │  Show event log                │
-  │  help, ?       │  Show this help                │
-  │  exit, quit, q │  Exit                          │
-  └────────────────┴────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────┐
+  │         LiFi-WiFi Receiver CLI                        │
+  ├────────────────────┬────────────────────────────────────┤
+  │  list, ls          │  List files on the sender          │
+  │  get <file>        │  Download a file                   │
+  │  stream <file>     │  Stream a video (HLS)              │
+  │  streams           │  Show active stream sessions       │
+  │  close <sid>       │  Close a streaming session         │
+  │  status, st        │  Show transfer progress            │
+  │  events            │  Show event log                    │
+  │  help, ?           │  Show this help                    │
+  │  exit, quit, q     │  Exit                              │
+  └────────────────────┴────────────────────────────────────┘
 """)
 
+
+def cmd_stream(filename: str):
+    """Start streaming a video file via HLS."""
+    if not filename:
+        print("  Usage: stream <filename>\n")
+        return
+
+    print(f"  Requesting stream: {filename}")
+    print("  Waiting for sender to prepare HLS segments (may take a few seconds)...")
+    result = _api_post(f"/api/stream_start/{urllib.request.quote(filename, safe='')}")
+    if result is None:
+        return
+
+    if "session_id" in result:
+        sid = result["session_id"]
+        vlc_url = result.get("vlc_url", f"http://localhost:{config.DASHBOARD_PORT}/api/hls/{sid}/playlist.m3u8")
+        duration = result.get("duration", 0)
+        segs = result.get("segment_count", 0)
+        res_w = result.get("width", 0)
+        res_h = result.get("height", 0)
+
+        print()
+        print(f"  ✓ Stream ready!")
+        print(f"  Session ID : {sid}")
+        if res_w and res_h:
+            print(f"  Resolution : {res_w}×{res_h}")
+        if duration:
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            print(f"  Duration   : {mins}m {secs}s")
+        print(f"  Segments   : {segs}")
+        print()
+        print(f"  ┌─ Play in VLC ─────────────────────────────────────────┐")
+        print(f"  │  vlc {vlc_url}")
+        print(f"  │                                                       │")
+        print(f"  │  Or open browser dashboard: http://localhost:{config.DASHBOARD_PORT}  │")
+        print(f"  └───────────────────────────────────────────────────────┘")
+        print(f"\n  Use 'close {sid}' to end this stream session.\n")
+    else:
+        print(f"  ✗ Stream failed: {result}\n")
+
+
+def cmd_streams():
+    """Show active streaming sessions."""
+    data = _api_get("/api/status")
+    if data is None:
+        return
+
+    sessions = data.get("stream_sessions", {})
+    if not sessions:
+        print("  No active streams.\n")
+        return
+
+    print()
+    print(f"  {'SID':<12} {'Filename':<35} {'Duration':<12} {'Segments'}")
+    print(f"  {'─'*12} {'─'*35} {'─'*12} {'─'*10}")
+    for sid, s in sessions.items():
+        dur = s.get('duration', 0)
+        dur_str = f"{int(dur//60)}m {int(dur%60)}s" if dur else "—"
+        print(f"  {sid:<12} {s.get('filename','?'):<35} {dur_str:<12} {s.get('segment_count','?')}")
+
+    print(f"\n  {len(sessions)} active stream(s). Use 'close <session_id>' to end.\n")
+
+
+def cmd_close_stream(session_id_str: str):
+    """Close a streaming session."""
+    if not session_id_str:
+        print("  Usage: close <session_id>\n")
+        return
+
+    try:
+        sid = int(session_id_str)
+    except ValueError:
+        print(f"  Invalid session ID: {session_id_str}\n")
+        return
+
+    result = _api_post(f"/api/stream_close/{sid}")
+    if result and result.get("status") == "ok":
+        print(f"  ✓ Stream session {sid} closed.\n")
+    elif result:
+        print(f"  ✗ Unexpected response: {result}\n")
 
 # ── main loop ────────────────────────────────────────────────
 
@@ -228,6 +315,12 @@ def main():
             cmd_list()
         elif cmd in ("get", "download", "dl"):
             cmd_download(arg)
+        elif cmd == "stream":
+            cmd_stream(arg)
+        elif cmd == "streams":
+            cmd_streams()
+        elif cmd == "close":
+            cmd_close_stream(arg)
         elif cmd in ("status", "st"):
             cmd_status()
         elif cmd in ("events", "ev"):

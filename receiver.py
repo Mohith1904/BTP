@@ -19,6 +19,7 @@ from urllib.parse import unquote
 import config
 from protocol.packet import Packet, PType
 from protocol.chunk_manager import ChunkReassembler
+from protocol.stream_manager import ReceiverStreamSession
 from network.manager import NetworkManager
 
 logging.basicConfig(
@@ -46,6 +47,15 @@ class Receiver:
         self._seq = 0
         self._file_list_event = threading.Event()
 
+        # ── streaming state ─────────────────────────────────
+        self.stream_sessions: dict[int, ReceiverStreamSession] = {}
+        self._stream_meta_event = threading.Event()  # signaled when STREAM_META arrives
+        self._stream_meta_data: dict = {}            # temp storage for stream meta
+        # Maps transfer_session_id -> (stream_session_id, segment_index)
+        self._segment_map: dict[int, tuple[int, int]] = {}
+        # Maps transfer_session_id -> threading.Event (signaled when segment transfer completes)
+        self._segment_events: dict[int, threading.Event] = {}
+
         # ── heartbeat tracking ──────────────────────────────
         self.last_hb_time = time.time()
         self.lifi_alive = True
@@ -59,6 +69,7 @@ class Receiver:
             "start_time": time.time(),
             "transfers": {},
             "events": [],
+            "stream_sessions": {},
         }
         self._stats_lock = threading.Lock()
 
@@ -90,6 +101,9 @@ class Receiver:
         self.net.on_ctrl(PType.TRANSFER_COMPLETE, self._on_transfer_complete)
         self.net.on_ctrl(PType.SWITCH_NOTIFY, self._on_switch_notify)
         self.net.on_ctrl(PType.SWITCH_BACK, self._on_switch_back)
+
+        # Streaming handler
+        self.net.on_ctrl(PType.STREAM_META, self._on_stream_meta)
 
     # ── handlers ────────────────────────────────────────────
     def _on_data(self, pkt: Packet, addr, iface):
@@ -138,8 +152,23 @@ class Receiver:
             log.info("Duplicate FILE_META for session %d ignored", sid)
             return
 
-        log.info("Receiving file: %s (%d chunks, %d bytes)",
-                 meta["filename"], meta["total_chunks"], meta["file_size"])
+        # Check if this is a streaming segment transfer
+        is_stream_seg = meta.get("is_stream_segment", False)
+        stream_sid = meta.get("stream_session_id", 0)
+        seg_index = meta.get("segment_index", 0)
+
+        if is_stream_seg:
+            # Route to streaming cache directory instead of received/
+            stream_session = self.stream_sessions.get(stream_sid)
+            if not stream_session:
+                log.warning("Stream segment for unknown stream session %d", stream_sid)
+                return
+            output_dir = stream_session.cache_dir
+            log.debug("Receiving stream segment %d for session %d", seg_index, stream_sid)
+        else:
+            output_dir = config.RECEIVE_FOLDER
+            log.info("Receiving file: %s (%d chunks, %d bytes)",
+                     meta["filename"], meta["total_chunks"], meta["file_size"])
 
         reassembler = ChunkReassembler(
             filename=meta["filename"],
@@ -147,23 +176,27 @@ class Receiver:
             total_chunks=meta["total_chunks"],
             chunk_size=meta["chunk_size"],
             file_hash=meta["file_hash"],
-            output_dir=config.RECEIVE_FOLDER,
+            output_dir=output_dir,
         )
         self.reassemblers[sid] = reassembler
 
-        with self._stats_lock:
-            self.stats["transfers"][sid] = {
-                "filename": meta["filename"],
-                "file_size": meta["file_size"],
-                "total_chunks": meta["total_chunks"],
-                "progress": 0.0,
-                "received": 0,
-                "bytes": 0,
-                "started": time.time(),
-                "completed": False,
-            }
-
-        self._add_event(f"Transfer started: {meta['filename']}")
+        if is_stream_seg:
+            # Track mapping so we can signal completion
+            self._segment_map[sid] = (stream_sid, seg_index)
+            self._segment_events[sid] = threading.Event()
+        else:
+            with self._stats_lock:
+                self.stats["transfers"][sid] = {
+                    "filename": meta["filename"],
+                    "file_size": meta["file_size"],
+                    "total_chunks": meta["total_chunks"],
+                    "progress": 0.0,
+                    "received": 0,
+                    "bytes": 0,
+                    "started": time.time(),
+                    "completed": False,
+                }
+            self._add_event(f"Transfer started: {meta['filename']}")
 
     def _on_file_list_response(self, pkt: Packet, addr, iface):
         data = pkt.json_payload()
@@ -176,6 +209,25 @@ class Receiver:
         reassembler = self.reassemblers.get(sid)
         if not reassembler:
             return  # already handled or unknown session
+
+        # Check if this is a streaming segment completion
+        seg_info = self._segment_map.get(sid)
+        if seg_info:
+            stream_sid, seg_index = seg_info
+            stream_session = self.stream_sessions.get(stream_sid)
+            if stream_session and reassembler.is_complete:
+                # The reassembler wrote the segment file; mark it as cached
+                stream_session.mark_received(seg_index)
+                log.debug("Stream segment %d complete for session %d", seg_index, stream_sid)
+            # Signal the waiting HTTP handler
+            event = self._segment_events.pop(sid, None)
+            if event:
+                event.set()
+            self._segment_map.pop(sid, None)
+            self.reassemblers.pop(sid, None)
+            return
+
+        # Normal file transfer completion
         if reassembler.is_complete:
             ok = reassembler.verify()
             status = "VERIFIED ✓" if ok else "HASH MISMATCH ✗"
@@ -262,6 +314,111 @@ class Receiver:
         self.net.send_ctrl(pkt)
         log.info("Requested file: %s", filename)
 
+    # ── streaming commands ────────────────────────────────
+    def request_stream(self, filename: str) -> dict | None:
+        """Ask sender to start streaming a video file.
+        Returns stream session info dict or None on failure.
+        """
+        self._stream_meta_event.clear()
+        self._stream_meta_data = {}
+
+        payload = Packet.make_json_payload({"filename": filename})
+        pkt = Packet(PType.STREAM_REQUEST, seq_num=self._next_seq(), payload=payload)
+        self.net.send_ctrl(pkt)
+        self.net.send_ctrl(pkt, interface="wifi")  # send on both
+        log.info("Requesting stream: %s", filename)
+
+        # Wait for STREAM_META from sender (ffmpeg needs a few seconds)
+        if not self._stream_meta_event.wait(timeout=30):
+            log.error("Stream request timed out for: %s", filename)
+            return None
+
+        return self._stream_meta_data
+
+    def _on_stream_meta(self, pkt: Packet, addr, iface):
+        """Handle STREAM_META from sender — create receiver stream session."""
+        meta = pkt.json_payload()
+        session_id = meta.get("session_id", 0)
+
+        # Ignore duplicate
+        if session_id in self.stream_sessions:
+            log.info("Duplicate STREAM_META for session %d ignored", session_id)
+            return
+
+        session = ReceiverStreamSession(
+            session_id=session_id,
+            filename=meta.get("filename", ""),
+            m3u8_content=meta.get("m3u8", ""),
+            metadata=meta,
+            cache_base_dir=config.HLS_CACHE_DIR,
+            dashboard_port=config.DASHBOARD_PORT,
+            buffer_behind=config.HLS_BUFFER_BEHIND,
+            buffer_ahead=config.HLS_BUFFER_AHEAD,
+        )
+        self.stream_sessions[session_id] = session
+
+        with self._stats_lock:
+            self.stats["stream_sessions"][session_id] = {
+                "filename": meta.get("filename", ""),
+                "duration": meta.get("duration", 0),
+                "segment_count": meta.get("segment_count", 0),
+                "vlc_url": session.vlc_url,
+            }
+
+        self._stream_meta_data = {
+            "session_id": session_id,
+            "filename": meta.get("filename", ""),
+            "duration": meta.get("duration", 0),
+            "width": meta.get("width", 0),
+            "height": meta.get("height", 0),
+            "segment_count": meta.get("segment_count", 0),
+            "segment_duration": meta.get("segment_duration", 4),
+            "vlc_url": session.vlc_url,
+        }
+        self._stream_meta_event.set()
+
+        self._add_event(f"Stream started: {meta.get('filename', '?')}")
+        log.info("Stream session %d: %s (%d segments, VLC: %s)",
+                 session_id, meta.get('filename'), meta.get('segment_count', 0), session.vlc_url)
+
+    def _request_segment(self, stream_session_id: int, segment_index: int):
+        """Request a specific segment from the sender."""
+        session = self.stream_sessions.get(stream_session_id)
+        if not session:
+            return
+        if session.has_segment(segment_index):
+            return  # already cached
+        if session.is_pending(segment_index):
+            return  # already being fetched
+        if segment_index < 0 or segment_index >= session.segment_count:
+            return  # out of range
+
+        session.mark_pending(segment_index)
+
+        payload = Packet.make_json_payload({
+            "stream_session_id": stream_session_id,
+            "segment_index": segment_index,
+        })
+        pkt = Packet(PType.STREAM_SEGMENT_REQUEST, seq_num=self._next_seq(), payload=payload)
+        self.net.send_ctrl(pkt)
+        self.net.send_ctrl(pkt, interface="wifi")  # send on both
+        log.debug("Requested segment %d for stream %d", segment_index, stream_session_id)
+
+    def close_stream(self, session_id: int):
+        """Close a streaming session."""
+        session = self.stream_sessions.pop(session_id, None)
+        if session:
+            session.cleanup()
+            with self._stats_lock:
+                self.stats["stream_sessions"].pop(session_id, None)
+
+        payload = Packet.make_json_payload({"stream_session_id": session_id})
+        pkt = Packet(PType.STREAM_CLOSE, seq_num=self._next_seq(), payload=payload)
+        self.net.send_ctrl(pkt)
+        self.net.send_ctrl(pkt, interface="wifi")
+        self._add_event(f"Stream closed: session {session_id}")
+        log.info("Stream session %d closed", session_id)
+
     # ── heartbeat monitor ───────────────────────────────────
     def _heartbeat_monitor(self):
         while self.net.running:
@@ -295,6 +452,8 @@ class Receiver:
                 elif self.path.startswith("/api/stream/"):
                     filename = unquote(self.path[len("/api/stream/"):])
                     self._serve_stream(filename)
+                elif self.path.startswith("/api/hls/"):
+                    self._serve_hls(self.path)
                 elif self.path == "/api/events":
                     self._sse_stream()
                 else:
@@ -305,6 +464,17 @@ class Receiver:
                     filename = unquote(self.path[len("/api/download/"):])
                     self.receiver.request_file(filename)
                     self._json_response({"status": "ok", "filename": filename})
+                elif self.path.startswith("/api/stream_start/"):
+                    filename = unquote(self.path[len("/api/stream_start/"):])
+                    self._handle_stream_start(filename)
+                elif self.path.startswith("/api/stream_close/"):
+                    sid_str = self.path[len("/api/stream_close/"):]
+                    try:
+                        sid = int(sid_str)
+                        self.receiver.close_stream(sid)
+                        self._json_response({"status": "ok"})
+                    except ValueError:
+                        self.send_error(400, "Invalid session ID")
                 else:
                     self.send_error(404)
 
@@ -316,6 +486,141 @@ class Receiver:
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _handle_stream_start(self, filename):
+                """Start a streaming session — runs ffmpeg on sender, waits for metadata."""
+                result = self.receiver.request_stream(filename)
+                if result:
+                    self._json_response(result)
+                else:
+                    self.send_error(504, "Stream request timed out or failed")
+
+            def _serve_hls(self, path):
+                """Serve HLS playlist or segment files for the streaming player.
+
+                Routes:
+                    /api/hls/<session_id>/playlist.m3u8
+                    /api/hls/<session_id>/seg_NNNNN.ts
+                """
+                # Parse: /api/hls/<session_id>/<filename>
+                parts = path.split("/")
+                # parts = ['', 'api', 'hls', '<session_id>', '<filename>']
+                if len(parts) < 5:
+                    self.send_error(400, "Invalid HLS path")
+                    return
+
+                try:
+                    session_id = int(parts[3])
+                except ValueError:
+                    self.send_error(400, "Invalid session ID")
+                    return
+
+                filename = unquote(parts[4])
+                session = self.receiver.stream_sessions.get(session_id)
+                if not session:
+                    self.send_error(404, "Stream session not found")
+                    return
+
+                if filename == "playlist.m3u8":
+                    # Serve the rewritten M3U8 playlist
+                    body = session.get_local_playlist().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self.send_header("Content-Length", len(body))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if not filename.endswith(".ts"):
+                    self.send_error(400, "Invalid segment filename")
+                    return
+
+                # Parse segment index from filename like "seg_00005.ts"
+                try:
+                    seg_name = filename.replace(".ts", "")
+                    seg_index = int(seg_name.split("_")[1])
+                except (IndexError, ValueError):
+                    self.send_error(400, "Cannot parse segment index")
+                    return
+
+                if seg_index < 0 or seg_index >= session.segment_count:
+                    self.send_error(404, "Segment out of range")
+                    return
+
+                # Check cache — if segment is already downloaded, serve it immediately
+                if session.has_segment(seg_index):
+                    self._serve_ts_file(session.get_segment_path(seg_index))
+                    # Prefetch next segments in background
+                    self._prefetch_segments(session_id, seg_index)
+                    # Buffer management: delete old segments
+                    session.manage_buffer(seg_index)
+                    return
+
+                # Cache miss — request segment from sender and wait
+                # Compute derived transfer session ID (must match sender's derivation)
+                transfer_sid = session_id ^ ((seg_index + 0x10000) & 0xFFFFFFFF)
+
+                # Request the segment
+                self.receiver._request_segment(session_id, seg_index)
+
+                # Also prefetch next segments
+                self._prefetch_segments(session_id, seg_index)
+
+                # Wait for the segment to arrive
+                event = self.receiver._segment_events.get(transfer_sid)
+                if not event:
+                    # The event might not exist yet if FILE_META hasn't arrived.
+                    # Create one and wait.
+                    event = threading.Event()
+                    self.receiver._segment_events[transfer_sid] = event
+
+                timeout = config.STREAM_SEGMENT_TIMEOUT
+                if event.wait(timeout=timeout):
+                    if session.has_segment(seg_index):
+                        self._serve_ts_file(session.get_segment_path(seg_index))
+                        session.manage_buffer(seg_index)
+                    else:
+                        self.send_error(502, "Segment transfer failed")
+                else:
+                    self.send_error(504, f"Segment {seg_index} timed out ({timeout}s)")
+
+            def _serve_ts_file(self, filepath):
+                """Serve a .ts segment file."""
+                if not os.path.exists(filepath):
+                    self.send_error(404, "Segment file not found")
+                    return
+
+                file_size = os.path.getsize(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t")
+                self.send_header("Content-Length", file_size)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "max-age=3600")
+                self.end_headers()
+
+                with open(filepath, "rb") as f:
+                    remaining = file_size
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+
+            def _prefetch_segments(self, session_id, current_segment):
+                """Request upcoming segments in background threads."""
+                session = self.receiver.stream_sessions.get(session_id)
+                if not session:
+                    return
+                to_prefetch = session.segments_to_prefetch(current_segment + 1)
+                for seg_idx in to_prefetch[:5]:  # limit concurrent prefetches
+                    threading.Thread(
+                        target=self.receiver._request_segment,
+                        args=(session_id, seg_idx),
+                        daemon=True,
+                    ).start()
 
             def _serve_stream(self, filename):
                 """Serve a file from received folder (supports Range requests for video)."""

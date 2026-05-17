@@ -45,6 +45,12 @@ class PType:
     FILE_LIST_RESPONSE= 0x0C
     FILE_REQUEST      = 0x0D
 
+    # ── Streaming ───────────────────────────────────────────
+    STREAM_REQUEST         = 0x0E   # Receiver → Sender: start streaming a video
+    STREAM_META            = 0x0F   # Sender → Receiver: HLS playlist + metadata
+    STREAM_SEGMENT_REQUEST = 0x10   # Receiver → Sender: send me segment N
+    STREAM_CLOSE           = 0x11   # Receiver → Sender: stop streaming session
+
     _NAMES = {
         0x01: "DATA",       0x02: "ACK",
         0x03: "HEARTBEAT",  0x04: "HEARTBEAT_ACK",
@@ -53,6 +59,8 @@ class PType:
         0x09: "FILE_META",      0x0A: "TRANSFER_COMPLETE",
         0x0B: "FILE_LIST_REQ",  0x0C: "FILE_LIST_RESP",
         0x0D: "FILE_REQUEST",
+        0x0E: "STREAM_REQ",      0x0F: "STREAM_META",
+        0x10: "STREAM_SEG_REQ",  0x11: "STREAM_CLOSE",
     }
 
     @classmethod

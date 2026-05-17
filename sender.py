@@ -16,6 +16,7 @@ import threading
 import config
 from protocol.packet import Packet, PType
 from protocol.chunk_manager import FileChunker
+from protocol.stream_manager import SenderStreamSession
 from network.manager import NetworkManager
 
 logging.basicConfig(
@@ -42,6 +43,9 @@ class Sender:
         self.acked_chunks: dict[int, set] = {}         # session_id -> set of acked chunk_ids
         self._seq = 0
         self._state_lock = threading.Lock()  # protects shared mutable state
+
+        # ── streaming state ─────────────────────────────────
+        self.stream_sessions: dict[int, SenderStreamSession] = {}
 
         # ── heartbeat state ─────────────────────────────────
         self.hb_seq = 0
@@ -80,6 +84,11 @@ class Sender:
         self.net.on_ctrl(PType.FILE_REQUEST, self._on_file_request)
         self.net.on_ctrl(PType.SWITCH_ACK, self._on_switch_ack)
         self.net.on_ctrl(PType.SWITCH_BACK_ACK, self._on_switchback_ack)
+
+        # Streaming handlers
+        self.net.on_ctrl(PType.STREAM_REQUEST, self._on_stream_request)
+        self.net.on_ctrl(PType.STREAM_SEGMENT_REQUEST, self._on_stream_segment_request)
+        self.net.on_ctrl(PType.STREAM_CLOSE, self._on_stream_close)
 
     # ── handlers ────────────────────────────────────────────
     def _on_ack(self, pkt: Packet, addr, iface):
@@ -137,6 +146,114 @@ class Sender:
         log.info("Receiver acknowledged switch back to LiFi")
         self._switchback_ack_event.set()
 
+    # ── streaming handlers ───────────────────────────────────
+    def _on_stream_request(self, pkt: Packet, addr, iface):
+        info = pkt.json_payload()
+        filename = info.get("filename", "")
+        filepath = os.path.join(config.SHARED_FOLDER, filename)
+
+        # Path traversal protection
+        root = os.path.abspath(config.SHARED_FOLDER)
+        resolved = os.path.abspath(filepath)
+        if not resolved.startswith(root + os.sep) and resolved != root:
+            log.error("Stream: path traversal rejected: %s", filename)
+            return
+
+        if not os.path.isfile(filepath):
+            log.error("Stream: file not found: %s", filename)
+            return
+
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in config.STREAM_VIDEO_EXTENSIONS:
+            log.error("Stream: unsupported extension %s for: %s", ext, filename)
+            return
+
+        log.info("Stream request: %s (via %s)", filename, iface)
+        session_id = random.randint(1, 0xFFFFFFFF)
+
+        # Run HLS segmentation in a background thread
+        def _prepare_and_send_meta():
+            session = SenderStreamSession(
+                session_id=session_id,
+                filepath=filepath,
+                hls_cache_dir=config.HLS_CACHE_DIR,
+                ffmpeg_path=config.FFMPEG_PATH,
+                ffprobe_path=config.FFPROBE_PATH,
+                segment_duration=config.HLS_SEGMENT_DURATION,
+            )
+            if not session.prepare_hls():
+                log.error("Stream: ffmpeg HLS segmentation failed for %s", filename)
+                log.error("Ensure the video uses H.264/AAC codecs. "
+                          "Re-encode with: ffmpeg -i input -c:v libx264 -c:a aac output.mp4")
+                return
+
+            self.stream_sessions[session_id] = session
+
+            # Send STREAM_META to receiver (on both interfaces)
+            meta_payload = Packet.make_json_payload(session.get_stream_meta_payload())
+            meta_pkt = Packet(
+                PType.STREAM_META,
+                seq_num=self._next_seq(),
+                session_id=session_id,
+                payload=meta_payload,
+            )
+            self.net.send_ctrl(meta_pkt, interface="lifi")
+            self.net.send_ctrl(meta_pkt, interface="wifi")
+            log.info("Stream session %d ready: %s (%d segments)",
+                     session_id, filename, session.segment_count)
+
+        t = threading.Thread(target=_prepare_and_send_meta, daemon=True)
+        t.start()
+
+    def _on_stream_segment_request(self, pkt: Packet, addr, iface):
+        info = pkt.json_payload()
+        stream_sid = info.get("stream_session_id", 0)
+        seg_index = info.get("segment_index", 0)
+
+        session = self.stream_sessions.get(stream_sid)
+        if not session:
+            log.warning("Stream segment request for unknown session %d", stream_sid)
+            return
+
+        seg_path = session.get_segment_path(seg_index)
+        if not seg_path:
+            log.warning("Stream segment %d not found for session %d", seg_index, stream_sid)
+            return
+
+        # Use a derived session ID so the existing DATA/ACK pipeline works
+        # without conflicting with file downloads or other segments
+        transfer_sid = stream_sid ^ ((seg_index + 0x10000) & 0xFFFFFFFF)
+
+        log.debug("Sending stream segment %d for session %d (transfer_sid=%d)",
+                  seg_index, stream_sid, transfer_sid)
+
+        # Send the segment using the existing _send_file mechanism.
+        # We pass extra metadata so the receiver knows this is a streaming segment.
+        t = threading.Thread(
+            target=self._send_file,
+            args=(seg_path, transfer_sid),
+            kwargs={
+                "stream_meta": {
+                    "is_stream_segment": True,
+                    "stream_session_id": stream_sid,
+                    "segment_index": seg_index,
+                },
+            },
+            daemon=True,
+        )
+        t.start()
+
+    def _on_stream_close(self, pkt: Packet, addr, iface):
+        info = pkt.json_payload()
+        stream_sid = info.get("stream_session_id", 0)
+
+        session = self.stream_sessions.pop(stream_sid, None)
+        if session:
+            session.cleanup()
+            log.info("Stream session %d closed: %s", stream_sid, session.filename)
+        else:
+            log.debug("Stream close for unknown session %d", stream_sid)
+
     # ── shared folder scanning ──────────────────────────────
     def _scan_shared_folder(self) -> list[dict]:
         files = []
@@ -152,7 +269,7 @@ class Sender:
         return files
 
     # ── file transfer ───────────────────────────────────────
-    def _send_file(self, filepath: str, session_id: int):
+    def _send_file(self, filepath: str, session_id: int, stream_meta: dict | None = None):
         chunker = FileChunker(filepath, config.CHUNK_SIZE)
         meta = chunker.metadata()
         total = chunker.total_chunks
@@ -171,12 +288,15 @@ class Sender:
         }
 
         # 1) Send FILE_META
+        meta_for_payload = dict(meta)
+        if stream_meta:
+            meta_for_payload.update(stream_meta)
         meta_pkt = Packet(
             PType.FILE_META,
             seq_num=self._next_seq(),
             session_id=session_id,
             total_chunks=total,
-            payload=Packet.make_json_payload(meta),
+            payload=Packet.make_json_payload(meta_for_payload),
         )
         self.net.send_ctrl(meta_pkt)
         # Also send via wifi so receiver has metadata on both
