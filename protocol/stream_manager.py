@@ -15,6 +15,8 @@ import re
 import tempfile
 import threading
 
+import config
+
 log = logging.getLogger("stream")
 
 
@@ -89,6 +91,7 @@ class SenderStreamSession:
         self.filepath = filepath
         self.filename = os.path.basename(filepath)
         self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
         self.segment_duration = segment_duration
 
         # Create a temp directory for this session's HLS files
@@ -107,45 +110,27 @@ class SenderStreamSession:
         """Run ffmpeg to segment the video into HLS format.
 
         Returns True on success, False on failure.
-        Uses -codec copy (no re-encoding) for speed.
+        Uses -codec copy first for speed, then falls back to H.264/AAC
+        if the generated fragments are not browser-playable.
         """
-        playlist_path = os.path.join(self.hls_dir, "playlist.m3u8")
-        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
+        if not self._run_hls_segmentation(mode="copy"):
+            return False
 
-        cmd = [
-            self.ffmpeg_path,
-            "-i", self.filepath,
-            "-codec", "copy",
-            "-start_number", "0",
-            "-hls_time", str(self.segment_duration),
-            "-hls_list_size", "0",
-            "-hls_playlist_type", "vod",
-            "-hls_segment_filename", segment_pattern,
-            "-f", "hls",
-            "-y",  # overwrite
-            playlist_path,
-        ]
-
-        log.info("Running ffmpeg HLS segmentation for: %s", self.filename)
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode != 0:
-                log.error("ffmpeg HLS failed (returncode=%d): %s",
-                          result.returncode, result.stderr[-500:] if result.stderr else "")
+        if not self._hls_is_browser_playable():
+            if not config.HLS_TRANSCODE_FALLBACK:
+                log.error("HLS fragments are not browser-playable; enable HLS_TRANSCODE_FALLBACK")
                 return False
-        except subprocess.TimeoutExpired:
-            log.error("ffmpeg timed out after 300s for: %s", self.filename)
-            return False
-        except FileNotFoundError:
-            log.error("ffmpeg not found at: %s", self.ffmpeg_path)
-            return False
+            log.warning("HLS copy output is not browser-playable; transcoding %s to H.264/AAC",
+                        self.filename)
+            self._clear_hls_outputs()
+            if not self._run_hls_segmentation(mode="transcode"):
+                return False
+            if not self._hls_is_browser_playable():
+                log.error("HLS transcode output is still not browser-playable for: %s",
+                          self.filename)
+                return False
 
-        # Read the playlist
-        if not os.path.isfile(playlist_path):
-            log.error("Playlist not created: %s", playlist_path)
-            return False
+        playlist_path = os.path.join(self.hls_dir, "playlist.m3u8")
 
         with open(playlist_path, "r", encoding="utf-8") as f:
             self.m3u8_content = f.read()
@@ -164,6 +149,127 @@ class SenderStreamSession:
         self._prepared = True
         log.info("HLS ready: %s → %d segments (%.1fs each)",
                  self.filename, self.segment_count, self.segment_duration)
+        return True
+
+    def _run_hls_segmentation(self, mode: str) -> bool:
+        """Create HLS playlist/segments using either copy or transcode mode."""
+        playlist_path = os.path.join(self.hls_dir, "playlist.m3u8")
+        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
+
+        cmd = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-i", self.filepath,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+        ]
+        if mode == "copy":
+            cmd.extend(["-c", "copy"])
+        else:
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                "-sc_threshold", "0",
+                "-force_key_frames", f"expr:gte(t,n_forced*{self.segment_duration})",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ac", "2",
+            ])
+
+        cmd.extend([
+            "-start_number", "0",
+            "-hls_time", str(self.segment_duration),
+            "-hls_list_size", "0",
+            "-hls_playlist_type", "vod",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_filename", segment_pattern,
+            "-f", "hls",
+            "-y",
+            playlist_path,
+        ])
+
+        log.info("Running ffmpeg HLS segmentation (%s) for: %s", mode, self.filename)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            log.error("ffmpeg timed out after 600s for: %s", self.filename)
+            return False
+        except FileNotFoundError:
+            log.error("ffmpeg not found at: %s", self.ffmpeg_path)
+            return False
+
+        if result.returncode != 0:
+            log.error("ffmpeg HLS %s failed (returncode=%d): %s",
+                      mode, result.returncode,
+                      result.stderr[-800:] if result.stderr else "")
+            return False
+
+        if not os.path.isfile(playlist_path):
+            log.error("Playlist not created: %s", playlist_path)
+            return False
+        return True
+
+    def _clear_hls_outputs(self):
+        """Remove generated playlist and segment files before retrying."""
+        for name in os.listdir(self.hls_dir):
+            if name == "playlist.m3u8" or (name.startswith("seg_") and name.endswith(".ts")):
+                try:
+                    os.remove(os.path.join(self.hls_dir, name))
+                except OSError:
+                    pass
+
+    def _hls_is_browser_playable(self) -> bool:
+        """Validate that the first segment contains browser-compatible media."""
+        first_segment = self.get_segment_path(0)
+        if not first_segment:
+            log.error("HLS validation failed: first segment is missing")
+            return False
+
+        cmd = [
+            self.ffprobe_path,
+            "-v", "error",
+            "-show_streams",
+            "-of", "json",
+            first_segment,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                log.error("ffprobe HLS validation failed: %s", result.stderr[-500:])
+                return False
+            data = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+            log.error("ffprobe HLS validation error: %s", e)
+            return False
+
+        streams = data.get("streams", [])
+        video_codecs = [
+            s.get("codec_name", "")
+            for s in streams
+            if s.get("codec_type") == "video"
+        ]
+        audio_codecs = [
+            s.get("codec_name", "")
+            for s in streams
+            if s.get("codec_type") == "audio"
+        ]
+        if not video_codecs:
+            log.warning("HLS validation: no video stream found in first segment")
+            return False
+        if video_codecs[0] != "h264":
+            log.warning("HLS validation: video codec %s is not browser-safe H.264",
+                        video_codecs[0])
+            return False
+        unsupported_audio = [c for c in audio_codecs if c not in {"aac", "mp3"}]
+        if unsupported_audio:
+            log.warning("HLS validation: unsupported audio codec(s): %s",
+                        ", ".join(unsupported_audio))
+            return False
         return True
 
     @property
