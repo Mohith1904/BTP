@@ -217,16 +217,27 @@ class Receiver:
         if seg_info:
             stream_sid, seg_index = seg_info
             stream_session = self.stream_sessions.get(stream_sid)
-            if stream_session and reassembler.is_complete:
-                # The reassembler wrote the segment file; mark it as cached
-                stream_session.mark_received(seg_index)
-                log.debug("Stream segment %d complete for session %d", seg_index, stream_sid)
-            # Signal the waiting HTTP handler
-            event = self._segment_events.pop(sid, None)
-            if event:
-                event.set()
-            self._segment_map.pop(sid, None)
-            self.reassemblers.pop(sid, None)
+            if stream_session:
+                if reassembler.is_complete:
+                    # All chunks received — mark segment as playable
+                    stream_session.mark_received(seg_index)
+                    log.debug("Stream segment %d complete for session %d", seg_index, stream_sid)
+                    self._segment_map.pop(sid, None)
+                    self.reassemblers.pop(sid, None)
+                else:
+                    # TRANSFER_COMPLETE arrived before all DATA (UDP reordering).
+                    # Give late packets a grace period, same as regular files.
+                    missing = len(reassembler.missing_chunks())
+                    log.debug("Segment %d: %d chunks missing, starting grace period",
+                              seg_index, missing)
+                    threading.Thread(
+                        target=self._segment_grace_period,
+                        args=(sid, stream_sid, seg_index),
+                        daemon=True,
+                    ).start()
+            else:
+                self._segment_map.pop(sid, None)
+                self.reassemblers.pop(sid, None)
             return
 
         # Normal file transfer completion
@@ -249,6 +260,35 @@ class Receiver:
                 args=(sid, missing),
                 daemon=True,
             ).start()
+
+    def _segment_grace_period(self, sid: int, stream_sid: int, seg_index: int):
+        """Wait for late UDP packets for a streaming segment, then finalize."""
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            reassembler = self.reassemblers.get(sid)
+            if not reassembler:
+                return  # already cleaned up by another path
+            if reassembler.is_complete:
+                break
+            time.sleep(0.1)
+
+        reassembler = self.reassemblers.pop(sid, None)
+        self._segment_map.pop(sid, None)
+        if not reassembler:
+            return
+
+        stream_session = self.stream_sessions.get(stream_sid)
+        if stream_session:
+            if reassembler.is_complete:
+                stream_session.mark_received(seg_index)
+                log.debug("Stream segment %d complete (after grace period)", seg_index)
+            else:
+                still_missing = len(reassembler.missing_chunks())
+                log.warning("Stream segment %d incomplete after grace period (%d chunks missing)",
+                            seg_index, still_missing)
+                # Still mark received so the player can try to play partial data
+                # rather than hanging forever
+                stream_session.mark_received(seg_index)
 
     def _grace_period_cleanup(self, sid: int, initial_missing: int):
         """Wait up to 2 seconds for late packets, then finalize the transfer."""
@@ -402,8 +442,9 @@ class Receiver:
             "segment_index": segment_index,
         })
         pkt = Packet(PType.STREAM_SEGMENT_REQUEST, seq_num=self._next_seq(), payload=payload)
+        # Send on active interface only — sending on both causes the sender to
+        # receive duplicate requests, doubling the FILE_META spam and transfer load
         self.net.send_ctrl(pkt)
-        self.net.send_ctrl(pkt, interface="wifi")  # send on both
         log.debug("Requested segment %d for stream %d", segment_index, stream_session_id)
 
     def close_stream(self, session_id: int):
