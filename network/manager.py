@@ -39,7 +39,7 @@ class NetworkManager:
         self.control_port = control_port
         self.recv_buffer = recv_buffer
 
-        self.active_interface = "lifi"  # 'lifi' or 'wifi'
+        self.active_interface = self._detect_initial_interface()
         self._lock = threading.Lock()
 
         # ── sockets ─────────────────────────────────────────
@@ -72,6 +72,29 @@ class NetworkManager:
     def peer_addr(self, interface: str | None = None) -> str:
         iface = interface or self.active_interface
         return self.peer_lifi_ip if iface == "lifi" else self.peer_wifi_ip
+
+    def interface_available(self, interface: str) -> bool:
+        """Return True if the local IP for an interface is present and up."""
+        target_ip = self.my_lifi_ip if interface == "lifi" else self.my_wifi_ip
+        try:
+            addrs = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
+            for name, addr_list in addrs.items():
+                stat = stats.get(name)
+                for a in addr_list:
+                    if a.family == socket.AF_INET and a.address == target_ip:
+                        return bool(stat.isup) if stat else True
+        except Exception:
+            pass
+        return False
+
+    def _detect_initial_interface(self) -> str:
+        """Prefer LiFi when present, otherwise start on WiFi if available."""
+        if self.interface_available("lifi"):
+            return "lifi"
+        if self.interface_available("wifi"):
+            return "wifi"
+        return "lifi"
 
     def switch_to(self, interface: str):
         with self._lock:
@@ -145,7 +168,8 @@ class NetworkManager:
         t1.start()
         t2.start()
         self._threads = [t1, t2]
-        log.info("NetworkManager started (data=%d, ctrl=%d)", self.data_port, self.control_port)
+        log.info("NetworkManager started (data=%d, ctrl=%d, active=%s)",
+                 self.data_port, self.control_port, self.active_interface)
 
     def stop(self):
         self.running = False

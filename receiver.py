@@ -65,7 +65,7 @@ class Receiver:
 
         # ── stats (pushed to dashboard via SSE) ─────────────
         self.stats = {
-            "active_interface": "lifi",
+            "active_interface": self.net.active_interface,
             "bytes_received": 0,
             "chunks_received": 0,
             "failover_count": 0,
@@ -81,6 +81,13 @@ class Receiver:
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
+
+    def _send_ctrl_with_fallback(self, pkt: Packet):
+        """Send a control packet on the active interface and the standby link."""
+        primary = self.net.active_interface
+        fallback = "wifi" if primary == "lifi" else "lifi"
+        self.net.send_ctrl(pkt, interface=primary)
+        self.net.send_ctrl(pkt, interface=fallback)
 
     def _add_event(self, msg: str):
         with self._stats_lock:
@@ -362,18 +369,20 @@ class Receiver:
         """Ask sender for list of shared files."""
         self._file_list_event.clear()
         pkt = Packet(PType.FILE_LIST_REQUEST, seq_num=self._next_seq())
-        # Send on both interfaces in case one is down
-        self.net.send_ctrl(pkt)
-        self.net.send_ctrl(pkt, interface="wifi")
+        self._send_ctrl_with_fallback(pkt)
         log.info("Requesting file list from sender...")
         self._file_list_event.wait(timeout=5)
         return self.file_list
 
     def request_file(self, filename: str):
         """Ask sender to transfer a specific file."""
-        payload = Packet.make_json_payload({"filename": filename})
+        request_id = (int(time.time() * 1000) ^ self._next_seq()) & 0xFFFFFFFF
+        payload = Packet.make_json_payload({
+            "filename": filename,
+            "request_id": request_id,
+        })
         pkt = Packet(PType.FILE_REQUEST, seq_num=self._next_seq(), payload=payload)
-        self.net.send_ctrl(pkt)
+        self._send_ctrl_with_fallback(pkt)
         log.info("Requested file: %s", filename)
 
     # ── streaming commands ────────────────────────────────
@@ -386,8 +395,7 @@ class Receiver:
 
         payload = Packet.make_json_payload({"filename": filename})
         pkt = Packet(PType.STREAM_REQUEST, seq_num=self._next_seq(), payload=payload)
-        self.net.send_ctrl(pkt)
-        self.net.send_ctrl(pkt, interface="wifi")  # send on both
+        self._send_ctrl_with_fallback(pkt)
         log.info("Requesting stream: %s", filename)
 
         # Wait for STREAM_META from sender. Transcode fallback can take minutes
@@ -457,9 +465,7 @@ class Receiver:
             "segment_index": segment_index,
         })
         pkt = Packet(PType.STREAM_SEGMENT_REQUEST, seq_num=self._next_seq(), payload=payload)
-        # Send on active interface only — sending on both causes the sender to
-        # receive duplicate requests, doubling the FILE_META spam and transfer load
-        self.net.send_ctrl(pkt)
+        self._send_ctrl_with_fallback(pkt)
         log.debug("Requested segment %d for stream %d", segment_index, stream_session_id)
 
     def close_stream(self, session_id: int):
@@ -472,8 +478,7 @@ class Receiver:
 
         payload = Packet.make_json_payload({"stream_session_id": session_id})
         pkt = Packet(PType.STREAM_CLOSE, seq_num=self._next_seq(), payload=payload)
-        self.net.send_ctrl(pkt)
-        self.net.send_ctrl(pkt, interface="wifi")
+        self._send_ctrl_with_fallback(pkt)
         self._add_event(f"Stream closed: session {session_id}")
         log.info("Stream session %d closed", session_id)
 
@@ -485,6 +490,9 @@ class Receiver:
             if elapsed > hb_timeout and self.lifi_alive:
                 self.lifi_alive = False
                 self._add_event("LiFi heartbeat lost — expecting failover")
+                if self.net.active_interface != "wifi" and self.net.interface_available("wifi"):
+                    self.net.switch_to("wifi")
+                    self.stats["active_interface"] = "wifi"
             time.sleep(config.HEARTBEAT_INTERVAL)
 
     # ── dashboard HTTP server ───────────────────────────────

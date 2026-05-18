@@ -41,6 +41,7 @@ class Sender:
         # ── transfer state ──────────────────────────────────
         self.active_transfers: dict[int, dict] = {}   # session_id -> state
         self.acked_chunks: dict[int, set] = {}         # session_id -> set of acked chunk_ids
+        self._recent_file_request_ids: set[int] = set()
         self._seq = 0
         self._state_lock = threading.Lock()  # protects shared mutable state
 
@@ -62,7 +63,7 @@ class Sender:
 
         # ── stats (for dashboard) ───────────────────────────
         self.stats = {
-            "active_interface": "lifi",
+            "active_interface": self.net.active_interface,
             "bytes_sent": 0,
             "chunks_sent": 0,
             "failover_count": 0,
@@ -123,6 +124,15 @@ class Sender:
     def _on_file_request(self, pkt: Packet, addr, iface):
         info = pkt.json_payload()
         filename = info.get("filename", "")
+        request_id = info.get("request_id")
+        if request_id is not None:
+            with self._state_lock:
+                if request_id in self._recent_file_request_ids:
+                    log.debug("Duplicate file request ignored: %s (%s)", filename, request_id)
+                    return
+                self._recent_file_request_ids.add(request_id)
+                if len(self._recent_file_request_ids) > 4096:
+                    self._recent_file_request_ids.clear()
         filepath = os.path.join(config.SHARED_FOLDER, filename)
 
         # Path traversal protection
@@ -135,6 +145,10 @@ class Sender:
         if not os.path.isfile(filepath):
             log.error("Requested file not found: %s", filename)
             return
+
+        if iface == "wifi" and (not self.lifi_alive or not self.net.interface_available("lifi")):
+            self.net.switch_to("wifi")
+            self.stats["active_interface"] = "wifi"
 
         log.info("File requested: %s (via %s)", filename, iface)
         session_id = random.randint(1, 0xFFFFFFFF)
@@ -241,6 +255,10 @@ class Sender:
             with self._state_lock:
                 self._active_seg_transfers.discard(seg_key)
             return
+
+        if iface == "wifi" and (not self.lifi_alive or not self.net.interface_available("lifi")):
+            self.net.switch_to("wifi")
+            self.stats["active_interface"] = "wifi"
 
         seg_path = session.get_segment_path(seg_index)
         if not seg_path:
