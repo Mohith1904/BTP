@@ -390,8 +390,9 @@ class Receiver:
         self.net.send_ctrl(pkt, interface="wifi")  # send on both
         log.info("Requesting stream: %s", filename)
 
-        # Wait for STREAM_META from sender (ffmpeg needs a few seconds)
-        if not self._stream_meta_event.wait(timeout=30):
+        # Wait for STREAM_META from sender. Transcode fallback can take minutes
+        # for browser-incompatible videos.
+        if not self._stream_meta_event.wait(timeout=config.STREAM_PREPARE_TIMEOUT):
             log.error("Stream request timed out for: %s", filename)
             return None
 

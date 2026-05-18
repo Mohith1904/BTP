@@ -60,6 +60,7 @@ HLS_PREFETCH_BATCH = 2          # max new segment requests to start per HLS requ
 HLS_MAX_PENDING_SEGMENTS = 4    # max stream segment transfers in flight
 HLS_TRANSCODE_FALLBACK = True   # re-encode to browser-safe H.264/AAC if copy output is invalid
 HLS_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".hls_cache")
+STREAM_PREPARE_TIMEOUT = 300    # max seconds to wait while sender prepares/transcodes HLS
 STREAM_SEGMENT_TIMEOUT = 10     # max seconds to wait for a segment from sender
 FFMPEG_PATH = "ffmpeg"          # full path if not in system PATH
 FFPROBE_PATH = "ffprobe"        # full path if not in system PATH
