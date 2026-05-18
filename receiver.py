@@ -55,6 +55,9 @@ class Receiver:
         self._segment_map: dict[int, tuple[int, int]] = {}
         # Maps transfer_session_id -> threading.Event (signaled when segment transfer completes)
         self._segment_events: dict[int, threading.Event] = {}
+        # Track completed transfer session IDs to prevent late FILE_META from
+        # re-creating reassemblers that overwrite completed segment files
+        self._completed_transfers: set[int] = set()
 
         # ── heartbeat tracking ──────────────────────────────
         self.last_hb_time = time.time()
@@ -110,6 +113,16 @@ class Receiver:
         sid = pkt.session_id
         reassembler = self.reassemblers.get(sid)
         if not reassembler:
+            if sid in self._completed_transfers:
+                ack = Packet(
+                    PType.ACK,
+                    seq_num=self._next_seq(),
+                    chunk_id=pkt.chunk_id,
+                    session_id=sid,
+                )
+                self.net.send_data(ack, interface=iface)
+                log.debug("Late DATA for completed session %d ignored", sid)
+                return
             log.warning("DATA for unknown session %d", sid)
             return
 
@@ -147,8 +160,8 @@ class Receiver:
         meta = pkt.json_payload()
         sid = pkt.session_id
 
-        # Ignore duplicate FILE_META for an already-active session
-        if sid in self.reassemblers:
+        # Ignore duplicate FILE_META for an already-active or already-completed session
+        if sid in self.reassemblers or sid in self._completed_transfers:
             log.info("Duplicate FILE_META for session %d ignored", sid)
             return
 
@@ -223,6 +236,7 @@ class Receiver:
                     # All chunks received — mark segment as playable
                     stream_session.mark_received(seg_index)
                     log.info("Stream segment %d complete for session %d", seg_index, stream_sid)
+                    self._completed_transfers.add(sid)
                     self._segment_map.pop(sid, None)
                     self.reassemblers.pop(sid, None)
                 else:
@@ -251,6 +265,7 @@ class Receiver:
                 if sid in self.stats["transfers"]:
                     self.stats["transfers"][sid]["completed"] = True
                     self.stats["transfers"][sid]["progress"] = reassembler.progress
+            self._completed_transfers.add(sid)
             self.reassemblers.pop(sid, None)
         else:
             # Grace period: wait for late UDP packets before giving up
@@ -275,6 +290,7 @@ class Receiver:
 
         reassembler = self.reassemblers.pop(sid, None)
         self._segment_map.pop(sid, None)
+        self._completed_transfers.add(sid)
         if not reassembler:
             return
 
@@ -287,9 +303,11 @@ class Receiver:
                 still_missing = len(reassembler.missing_chunks())
                 log.warning("Stream segment %d incomplete after grace period (%d chunks missing)",
                             seg_index, still_missing)
-                # Still mark received so the player can try to play partial data
-                # rather than hanging forever
-                stream_session.mark_received(seg_index)
+                stream_session.mark_failed(seg_index)
+                try:
+                    os.remove(reassembler.output_path)
+                except OSError:
+                    pass
 
     def _grace_period_cleanup(self, sid: int, initial_missing: int):
         """Wait up to 2 seconds for late packets, then finalize the transfer."""
@@ -313,6 +331,7 @@ class Receiver:
             if sid in self.stats["transfers"]:
                 self.stats["transfers"][sid]["completed"] = True
                 self.stats["transfers"][sid]["progress"] = reassembler.progress
+        self._completed_transfers.add(sid)
         self.reassemblers.pop(sid, None)
 
     def _on_switch_notify(self, pkt: Packet, addr, iface):
@@ -429,14 +448,8 @@ class Receiver:
         session = self.stream_sessions.get(stream_session_id)
         if not session:
             return
-        if session.has_segment(segment_index):
-            return  # already cached
-        if session.is_pending(segment_index):
-            return  # already being fetched
-        if segment_index < 0 or segment_index >= session.segment_count:
-            return  # out of range
-
-        session.mark_pending(segment_index)
+        if not session.reserve_segment(segment_index):
+            return  # cached, pending, or out of range
 
         payload = Packet.make_json_payload({
             "stream_session_id": stream_session_id,
@@ -597,10 +610,10 @@ class Receiver:
                 if session.has_segment(seg_index):
                     log.info("HLS: serving cached segment %d", seg_index)
                     self._serve_ts_file(session.get_segment_path(seg_index))
-                    # Prefetch next segments in background
-                    self._prefetch_segments(session_id, seg_index)
                     # Buffer management: delete old segments
                     session.manage_buffer(seg_index)
+                    # Prefetch next segments in background
+                    self._prefetch_segments(session_id, seg_index)
                     return
 
                 # Cache miss — request segment from sender and wait
@@ -620,8 +633,8 @@ class Receiver:
                     # Check if segment has been cached (transfer completed)
                     if session.has_segment(seg_index):
                         log.info("HLS: segment %d ready, serving", seg_index)
-                        self._serve_ts_file(session.get_segment_path(seg_index))
                         session.manage_buffer(seg_index)
+                        self._serve_ts_file(session.get_segment_path(seg_index))
                         served = True
                         break
                     # Brief sleep to avoid busy-waiting
@@ -659,8 +672,12 @@ class Receiver:
                 session = self.receiver.stream_sessions.get(session_id)
                 if not session:
                     return
-                to_prefetch = session.segments_to_prefetch(current_segment + 1)
-                for seg_idx in to_prefetch[:5]:  # limit concurrent prefetches
+                available_slots = config.HLS_MAX_PENDING_SEGMENTS - session.pending_count
+                if available_slots <= 0:
+                    return
+                to_prefetch = session.segments_to_prefetch(current_segment)
+                limit = min(config.HLS_PREFETCH_BATCH, available_slots)
+                for seg_idx in to_prefetch[:limit]:
                     threading.Thread(
                         target=self.receiver._request_segment,
                         args=(session_id, seg_idx),

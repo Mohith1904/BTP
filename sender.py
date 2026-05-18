@@ -48,6 +48,7 @@ class Sender:
         self.stream_sessions: dict[int, SenderStreamSession] = {}
         self._stream_preparing: set[str] = set()  # filenames currently being prepared
         self._active_seg_transfers: set[tuple] = set()  # (stream_sid, seg_index) in flight
+        self._recent_stream_transfer_ids: set[int] = set()
 
         # ── heartbeat state ─────────────────────────────────
         self.hb_seq = 0
@@ -227,26 +228,31 @@ class Sender:
 
         # Deduplicate: skip if this segment is already being transferred
         seg_key = (stream_sid, seg_index)
-        if seg_key in self._active_seg_transfers:
-            log.debug("Stream segment %d for session %d already in flight, skipping",
-                      seg_index, stream_sid)
-            return
+        with self._state_lock:
+            if seg_key in self._active_seg_transfers:
+                log.debug("Stream segment %d for session %d already in flight, skipping",
+                          seg_index, stream_sid)
+                return
+            self._active_seg_transfers.add(seg_key)
 
         session = self.stream_sessions.get(stream_sid)
         if not session:
             log.warning("Stream segment request for unknown session %d", stream_sid)
+            with self._state_lock:
+                self._active_seg_transfers.discard(seg_key)
             return
 
         seg_path = session.get_segment_path(seg_index)
         if not seg_path:
             log.warning("Stream segment %d not found for session %d", seg_index, stream_sid)
+            with self._state_lock:
+                self._active_seg_transfers.discard(seg_key)
             return
 
-        # Use a derived session ID so the existing DATA/ACK pipeline works
-        # without conflicting with file downloads or other segments
-        transfer_sid = stream_sid ^ ((seg_index + 0x10000) & 0xFFFFFFFF)
-
-        self._active_seg_transfers.add(seg_key)
+        # Use a fresh transfer ID for every request. Reusing the same ID for
+        # the same segment lets late ACKs from an older request complete a
+        # newer transfer before its data reaches the receiver.
+        transfer_sid = self._new_stream_transfer_id()
         log.debug("Sending stream segment %d for session %d (transfer_sid=%d)",
                   seg_index, stream_sid, transfer_sid)
 
@@ -263,10 +269,27 @@ class Sender:
                     },
                 )
             finally:
-                self._active_seg_transfers.discard(seg_key)
+                with self._state_lock:
+                    self._active_seg_transfers.discard(seg_key)
 
         t = threading.Thread(target=_send_and_cleanup, daemon=True)
         t.start()
+
+    def _new_stream_transfer_id(self) -> int:
+        """Return a transfer session ID that is not currently in use."""
+        with self._state_lock:
+            while True:
+                sid = random.randint(1, 0xFFFFFFFF)
+                if (
+                    sid not in self.active_transfers
+                    and sid not in self.acked_chunks
+                    and sid not in self._recent_stream_transfer_ids
+                    and sid not in self.stream_sessions
+                ):
+                    self._recent_stream_transfer_ids.add(sid)
+                    if len(self._recent_stream_transfer_ids) > 4096:
+                        self._recent_stream_transfer_ids.clear()
+                    return sid
 
     def _on_stream_close(self, pkt: Packet, addr, iface):
         info = pkt.json_payload()
@@ -283,7 +306,8 @@ class Sender:
         # before deleting the HLS temp files they're reading from.
         def _deferred_cleanup():
             for _ in range(60):  # poll for up to 30 seconds
-                active = any(sid == stream_sid for sid, _ in self._active_seg_transfers)
+                with self._state_lock:
+                    active = any(sid == stream_sid for sid, _ in self._active_seg_transfers)
                 if not active:
                     break
                 time.sleep(0.5)

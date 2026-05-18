@@ -13,6 +13,7 @@ import subprocess
 import logging
 import re
 import tempfile
+import threading
 
 log = logging.getLogger("stream")
 
@@ -245,6 +246,7 @@ class ReceiverStreamSession:
         # Track segments currently being fetched (to avoid duplicate requests)
         self._pending_segments: set[int] = set()
         self._current_segment = 0
+        self._lock = threading.Lock()
 
     def get_local_playlist(self) -> str:
         """Rewrite the M3U8 playlist so segment URLs point to localhost."""
@@ -264,20 +266,40 @@ class ReceiverStreamSession:
 
     def has_segment(self, index: int) -> bool:
         """Check if a segment is cached locally."""
-        return index in self._cached_segments
+        with self._lock:
+            return index in self._cached_segments
 
     def is_pending(self, index: int) -> bool:
         """Check if a segment is currently being fetched."""
-        return index in self._pending_segments
+        with self._lock:
+            return index in self._pending_segments
 
     def mark_pending(self, index: int):
         """Mark a segment as being fetched."""
-        self._pending_segments.add(index)
+        with self._lock:
+            self._pending_segments.add(index)
+
+    def reserve_segment(self, index: int) -> bool:
+        """Atomically reserve a segment for fetching."""
+        with self._lock:
+            if index < 0 or index >= self.segment_count:
+                return False
+            if index in self._cached_segments or index in self._pending_segments:
+                return False
+            self._pending_segments.add(index)
+            return True
 
     def mark_received(self, index: int):
         """Mark a segment as received and cached."""
-        self._cached_segments.add(index)
-        self._pending_segments.discard(index)
+        with self._lock:
+            self._cached_segments.add(index)
+            self._pending_segments.discard(index)
+
+    def mark_failed(self, index: int):
+        """Clear pending/cache state for a failed segment transfer."""
+        with self._lock:
+            self._pending_segments.discard(index)
+            self._cached_segments.discard(index)
 
     def get_segment_path(self, index: int) -> str:
         """Return the local cache path for a segment."""
@@ -301,17 +323,19 @@ class ReceiverStreamSession:
         keep_start = max(0, current_segment - self.buffer_behind)
         keep_end = min(self.segment_count - 1, current_segment + self.buffer_ahead)
 
-        to_delete = []
-        for seg_idx in list(self._cached_segments):
-            if seg_idx < keep_start or seg_idx > keep_end:
-                to_delete.append(seg_idx)
+        with self._lock:
+            to_delete = []
+            for seg_idx in list(self._cached_segments):
+                if seg_idx < keep_start or seg_idx > keep_end:
+                    to_delete.append(seg_idx)
 
         for seg_idx in to_delete:
             path = self.get_segment_path(seg_idx)
             try:
                 if os.path.exists(path):
                     os.remove(path)
-                self._cached_segments.discard(seg_idx)
+                with self._lock:
+                    self._cached_segments.discard(seg_idx)
             except OSError as e:
                 log.warning("Failed to delete segment %d: %s", seg_idx, e)
 
@@ -320,12 +344,14 @@ class ReceiverStreamSession:
                       len(to_delete), keep_start, keep_end)
 
     def segments_to_prefetch(self, current_segment: int) -> list[int]:
-        """Return list of segment indices that should be prefetched."""
+        """Return segment indices ahead of the current playback position."""
         result = []
+        start = current_segment + 1
         end = min(self.segment_count, current_segment + self.buffer_ahead + 1)
-        for i in range(current_segment, end):
-            if not self.has_segment(i) and not self.is_pending(i):
-                result.append(i)
+        with self._lock:
+            for i in range(start, end):
+                if i not in self._cached_segments and i not in self._pending_segments:
+                    result.append(i)
         return result
 
     @property
@@ -335,7 +361,13 @@ class ReceiverStreamSession:
 
     @property
     def cached_count(self) -> int:
-        return len(self._cached_segments)
+        with self._lock:
+            return len(self._cached_segments)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending_segments)
 
     def cleanup(self):
         """Delete all cached segments for this session."""
