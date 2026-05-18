@@ -164,7 +164,8 @@ class Receiver:
                 log.warning("Stream segment for unknown stream session %d", stream_sid)
                 return
             output_dir = stream_session.cache_dir
-            log.debug("Receiving stream segment %d for session %d", seg_index, stream_sid)
+            log.info("Receiving stream segment %d for session %d (transfer_sid=%d)",
+                     seg_index, stream_sid, sid)
         else:
             output_dir = config.RECEIVE_FOLDER
             log.info("Receiving file: %s (%d chunks, %d bytes)",
@@ -221,15 +222,15 @@ class Receiver:
                 if reassembler.is_complete:
                     # All chunks received — mark segment as playable
                     stream_session.mark_received(seg_index)
-                    log.debug("Stream segment %d complete for session %d", seg_index, stream_sid)
+                    log.info("Stream segment %d complete for session %d", seg_index, stream_sid)
                     self._segment_map.pop(sid, None)
                     self.reassemblers.pop(sid, None)
                 else:
                     # TRANSFER_COMPLETE arrived before all DATA (UDP reordering).
                     # Give late packets a grace period, same as regular files.
                     missing = len(reassembler.missing_chunks())
-                    log.debug("Segment %d: %d chunks missing, starting grace period",
-                              seg_index, missing)
+                    log.info("Segment %d: %d chunks missing, starting grace period",
+                             seg_index, missing)
                     threading.Thread(
                         target=self._segment_grace_period,
                         args=(sid, stream_sid, seg_index),
@@ -281,7 +282,7 @@ class Receiver:
         if stream_session:
             if reassembler.is_complete:
                 stream_session.mark_received(seg_index)
-                log.debug("Stream segment %d complete (after grace period)", seg_index)
+                log.info("Stream segment %d complete (after grace period)", seg_index)
             else:
                 still_missing = len(reassembler.missing_chunks())
                 log.warning("Stream segment %d incomplete after grace period (%d chunks missing)",
@@ -594,6 +595,7 @@ class Receiver:
 
                 # Check cache — if segment is already downloaded, serve it immediately
                 if session.has_segment(seg_index):
+                    log.info("HLS: serving cached segment %d", seg_index)
                     self._serve_ts_file(session.get_segment_path(seg_index))
                     # Prefetch next segments in background
                     self._prefetch_segments(session_id, seg_index)
@@ -602,6 +604,7 @@ class Receiver:
                     return
 
                 # Cache miss — request segment from sender and wait
+                log.info("HLS: segment %d cache miss, requesting from sender", seg_index)
                 self.receiver._request_segment(session_id, seg_index)
 
                 # Also prefetch next segments
@@ -616,6 +619,7 @@ class Receiver:
                 while time.time() < deadline:
                     # Check if segment has been cached (transfer completed)
                     if session.has_segment(seg_index):
+                        log.info("HLS: segment %d ready, serving", seg_index)
                         self._serve_ts_file(session.get_segment_path(seg_index))
                         session.manage_buffer(seg_index)
                         served = True
@@ -624,6 +628,7 @@ class Receiver:
                     time.sleep(0.3)
 
                 if not served:
+                    log.warning("HLS: segment %d timed out (%ds)", seg_index, timeout)
                     self.send_error(504, f"Segment {seg_index} timed out ({timeout}s)")
 
             def _serve_ts_file(self, filepath):

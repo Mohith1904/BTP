@@ -2,6 +2,7 @@
 received/
 shared/
 about_project/
+.hls_cache/
 
 # Python byte‑code / caches
 __pycache__/
