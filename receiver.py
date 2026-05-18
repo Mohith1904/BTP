@@ -183,7 +183,9 @@ class Receiver:
         if is_stream_seg:
             # Track mapping so we can signal completion
             self._segment_map[sid] = (stream_sid, seg_index)
-            self._segment_events[sid] = threading.Event()
+            # Don't overwrite existing event — _serve_hls may already be waiting on it
+            if sid not in self._segment_events:
+                self._segment_events[sid] = threading.Event()
         else:
             with self._stats_lock:
                 self.stats["transfers"][sid] = {
@@ -559,31 +561,28 @@ class Receiver:
                     return
 
                 # Cache miss — request segment from sender and wait
-                # Compute derived transfer session ID (must match sender's derivation)
-                transfer_sid = session_id ^ ((seg_index + 0x10000) & 0xFFFFFFFF)
-
-                # Request the segment
                 self.receiver._request_segment(session_id, seg_index)
 
                 # Also prefetch next segments
                 self._prefetch_segments(session_id, seg_index)
 
-                # Wait for the segment to arrive
-                event = self.receiver._segment_events.get(transfer_sid)
-                if not event:
-                    # The event might not exist yet if FILE_META hasn't arrived.
-                    # Create one and wait.
-                    event = threading.Event()
-                    self.receiver._segment_events[transfer_sid] = event
-
+                # Poll for segment arrival. We use a polling loop instead of
+                # a single event.wait() to avoid a race condition where
+                # _on_file_meta overwrites the event object we're waiting on.
                 timeout = config.STREAM_SEGMENT_TIMEOUT
-                if event.wait(timeout=timeout):
+                deadline = time.time() + timeout
+                served = False
+                while time.time() < deadline:
+                    # Check if segment has been cached (transfer completed)
                     if session.has_segment(seg_index):
                         self._serve_ts_file(session.get_segment_path(seg_index))
                         session.manage_buffer(seg_index)
-                    else:
-                        self.send_error(502, "Segment transfer failed")
-                else:
+                        served = True
+                        break
+                    # Brief sleep to avoid busy-waiting
+                    time.sleep(0.3)
+
+                if not served:
                     self.send_error(504, f"Segment {seg_index} timed out ({timeout}s)")
 
             def _serve_ts_file(self, filepath):

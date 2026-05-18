@@ -10,12 +10,12 @@ import os
 # ============================================================
 
 # Sender (Laptop A) IP addresses
-SENDER_LIFI_IP = "169.254.51.178"   # Ethernet IP (LiFi interface)
+SENDER_LIFI_IP = "169.254.157.236"   # Ethernet IP (LiFi interface)
 SENDER_WIFI_IP = "192.168.137.1"    # WiFi IP (Windows Mobile Hotspot host)
 
 # Receiver (Laptop B) IP addresses
-RECEIVER_LIFI_IP = "169.254.168.16" # Ethernet 2 IP (LiFi interface)
-RECEIVER_WIFI_IP = "192.168.137.227" # WiFi IP (connected to sender's hotspot)
+RECEIVER_LIFI_IP = "169.254.159.224" # Ethernet 2 IP (LiFi interface)
+RECEIVER_WIFI_IP = "192.168.137.67" # WiFi IP (connected to sender's hotspot)
 
 # ============================================================
 #  PORTS

@@ -1,5 +1,7 @@
 # Runtime data produced by the receiver
 received/
+shared/
+about_project/
 
 # Python byte‑code / caches
 __pycache__/
