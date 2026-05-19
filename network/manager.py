@@ -99,6 +99,9 @@ class NetworkManager:
     def switch_to(self, interface: str):
         with self._lock:
             old = self.active_interface
+            if old == interface:
+                log.debug("Interface already active: %s", interface)
+                return
             self.active_interface = interface
             log.warning("Interface switch: %s → %s", old, interface)
 

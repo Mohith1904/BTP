@@ -50,6 +50,7 @@ class Sender:
         self._stream_preparing: set[str] = set()  # filenames currently being prepared
         self._active_seg_transfers: set[tuple] = set()  # (stream_sid, seg_index) in flight
         self._recent_stream_transfer_ids: set[int] = set()
+        self._closing_stream_sessions: set[int] = set()
 
         # ── heartbeat state ─────────────────────────────────
         self.hb_seq = 0
@@ -243,6 +244,10 @@ class Sender:
         # Deduplicate: skip if this segment is already being transferred
         seg_key = (stream_sid, seg_index)
         with self._state_lock:
+            if stream_sid in self._closing_stream_sessions:
+                log.debug("Stream segment %d for closing session %d ignored",
+                          seg_index, stream_sid)
+                return
             if seg_key in self._active_seg_transfers:
                 log.debug("Stream segment %d for session %d already in flight, skipping",
                           seg_index, stream_sid)
@@ -313,9 +318,14 @@ class Sender:
         info = pkt.json_payload()
         stream_sid = info.get("stream_session_id", 0)
 
+        with self._state_lock:
+            self._closing_stream_sessions.add(stream_sid)
+
         session = self.stream_sessions.pop(stream_sid, None)
         if not session:
             log.debug("Stream close for unknown session %d", stream_sid)
+            with self._state_lock:
+                self._closing_stream_sessions.discard(stream_sid)
             return
 
         log.info("Stream session %d closing: %s", stream_sid, session.filename)
@@ -323,14 +333,26 @@ class Sender:
         # Defer cleanup: wait for any in-flight segment transfers to finish
         # before deleting the HLS temp files they're reading from.
         def _deferred_cleanup():
-            for _ in range(60):  # poll for up to 30 seconds
+            deadline = time.time() + 60
+            while time.time() < deadline:
                 with self._state_lock:
                     active = any(sid == stream_sid for sid, _ in self._active_seg_transfers)
                 if not active:
                     break
-                time.sleep(0.5)
-            session.cleanup()
-            log.info("Stream session %d closed: %s", stream_sid, session.filename)
+                time.sleep(0.2)
+
+            with self._state_lock:
+                active = any(sid == stream_sid for sid, _ in self._active_seg_transfers)
+
+            if active:
+                log.warning("Stream session %d still has active segment transfers; keeping HLS cache",
+                            stream_sid)
+            else:
+                session.cleanup()
+                log.info("Stream session %d closed: %s", stream_sid, session.filename)
+
+            with self._state_lock:
+                self._closing_stream_sessions.discard(stream_sid)
 
         threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
@@ -349,9 +371,28 @@ class Sender:
         return files
 
     # ── file transfer ───────────────────────────────────────
+    def _cleanup_transfer_state(self, session_id: int):
+        with self._state_lock:
+            self.active_transfers.pop(session_id, None)
+            self.acked_chunks.pop(session_id, None)
+
+    def _stream_transfer_cancelled(self, stream_meta: dict | None) -> bool:
+        if not stream_meta or not stream_meta.get("is_stream_segment"):
+            return False
+        stream_sid = stream_meta.get("stream_session_id")
+        with self._state_lock:
+            return (
+                stream_sid in self._closing_stream_sessions
+                or stream_sid not in self.stream_sessions
+            )
+
     def _send_file(self, filepath: str, session_id: int, stream_meta: dict | None = None):
-        chunker = FileChunker(filepath, config.CHUNK_SIZE)
-        meta = chunker.metadata()
+        try:
+            chunker = FileChunker(filepath, config.CHUNK_SIZE)
+            meta = chunker.metadata()
+        except FileNotFoundError:
+            log.warning("Transfer source disappeared before send started: %s", filepath)
+            return
         total = chunker.total_chunks
 
         with self._state_lock:
@@ -390,10 +431,16 @@ class Sender:
         retries: dict[int, int] = {}     # chunk_id -> retry_count
 
         while True:
+            if self._stream_transfer_cancelled(stream_meta):
+                log.info("Cancelled stream segment transfer: %s", meta["filename"])
+                self._cleanup_transfer_state(session_id)
+                return
+
             with self._state_lock:
                 if len(self.acked_chunks[session_id]) >= total:
                     break
             if not self.net.running:
+                self._cleanup_transfer_state(session_id)
                 return
 
             # Fill send window
@@ -402,7 +449,12 @@ class Sender:
                 with self._state_lock:
                     already_acked = next_chunk in self.acked_chunks[session_id]
                 if not already_acked:
-                    data = chunker.get_chunk(next_chunk)
+                    try:
+                        data = chunker.get_chunk(next_chunk)
+                    except FileNotFoundError:
+                        log.warning("Transfer source disappeared, cancelling: %s", filepath)
+                        self._cleanup_transfer_state(session_id)
+                        return
                     pkt = Packet(
                         PType.DATA,
                         seq_num=self._next_seq(),
@@ -434,7 +486,13 @@ class Sender:
                         # This avoids silently dropping a required chunk forever.
                         log.warning("Chunk %d exceeded max retries; continuing retransmit", cid)
                         retries[cid] = config.MAX_RETRIES
-                    data = chunker.get_chunk(cid)
+                    try:
+                        data = chunker.get_chunk(cid)
+                    except FileNotFoundError:
+                        log.warning("Transfer source disappeared during retransmit, cancelling: %s",
+                                    filepath)
+                        self._cleanup_transfer_state(session_id)
+                        return
                     pkt = Packet(
                         PType.DATA,
                         seq_num=self._next_seq(),

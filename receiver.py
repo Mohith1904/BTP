@@ -58,6 +58,7 @@ class Receiver:
         # Track completed transfer session IDs to prevent late FILE_META from
         # re-creating reassemblers that overwrite completed segment files
         self._completed_transfers: set[int] = set()
+        self._closed_stream_sessions: set[int] = set()
 
         # ── heartbeat tracking ──────────────────────────────
         self.last_hb_time = time.time()
@@ -133,8 +134,6 @@ class Receiver:
             log.warning("DATA for unknown session %d", sid)
             return
 
-        is_new = reassembler.add_chunk(pkt.chunk_id, pkt.payload)
-
         # Send ACK
         ack = Packet(
             PType.ACK,
@@ -142,6 +141,24 @@ class Receiver:
             chunk_id=pkt.chunk_id,
             session_id=sid,
         )
+
+        try:
+            is_new = reassembler.add_chunk(pkt.chunk_id, pkt.payload)
+        except FileNotFoundError:
+            seg_info = self._segment_map.pop(sid, None)
+            if seg_info:
+                stream_sid, seg_index = seg_info
+                stream_session = self.stream_sessions.get(stream_sid)
+                if stream_session:
+                    stream_session.mark_failed(seg_index)
+                self._segment_events.pop(sid, None)
+                self._completed_transfers.add(sid)
+                self.reassemblers.pop(sid, None)
+                self.net.send_data(ack, interface=iface)
+                log.debug("Late DATA for closed stream segment %d ignored", seg_index)
+                return
+            raise
+
         self.net.send_data(ack, interface=iface)
 
         if is_new:
@@ -176,6 +193,11 @@ class Receiver:
         is_stream_seg = meta.get("is_stream_segment", False)
         stream_sid = meta.get("stream_session_id", 0)
         seg_index = meta.get("segment_index", 0)
+
+        if is_stream_seg and stream_sid in self._closed_stream_sessions:
+            self._completed_transfers.add(sid)
+            log.debug("Ignoring FILE_META for closed stream session %d", stream_sid)
+            return
 
         if is_stream_seg:
             # Route to streaming cache directory instead of received/
@@ -471,14 +493,35 @@ class Receiver:
     def close_stream(self, session_id: int):
         """Close a streaming session."""
         session = self.stream_sessions.pop(session_id, None)
+        self._closed_stream_sessions.add(session_id)
+
+        payload = Packet.make_json_payload({"stream_session_id": session_id})
+        pkt = Packet(PType.STREAM_CLOSE, seq_num=self._next_seq(), payload=payload)
+        self._send_ctrl_with_fallback(pkt)
+
+        cancelled = []
+        for transfer_sid, seg_info in list(self._segment_map.items()):
+            stream_sid, seg_index = seg_info
+            if stream_sid != session_id:
+                continue
+            cancelled.append((transfer_sid, seg_index))
+            self._completed_transfers.add(transfer_sid)
+            self._segment_map.pop(transfer_sid, None)
+            self.reassemblers.pop(transfer_sid, None)
+            event = self._segment_events.pop(transfer_sid, None)
+            if event:
+                event.set()
+            if session:
+                session.mark_failed(seg_index)
+
         if session:
             session.cleanup()
             with self._stats_lock:
                 self.stats["stream_sessions"].pop(session_id, None)
 
-        payload = Packet.make_json_payload({"stream_session_id": session_id})
-        pkt = Packet(PType.STREAM_CLOSE, seq_num=self._next_seq(), payload=payload)
-        self._send_ctrl_with_fallback(pkt)
+        if cancelled:
+            log.info("Cancelled %d in-flight segment transfer(s) for stream session %d",
+                     len(cancelled), session_id)
         self._add_event(f"Stream closed: session {session_id}")
         log.info("Stream session %d closed", session_id)
 
