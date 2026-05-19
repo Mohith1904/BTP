@@ -6,7 +6,7 @@ Header (28 bytes):
   version     : 1 byte   (0x01)
   packet_type : 1 byte
   seq_num     : 4 bytes   (unsigned, monotonic per sender)
-  chunk_id    : 4 bytes   (unsigned, index within file)
+  chunk_id    : 4 bytes   (unsigned, chunk index or byte offset in byte-range mode)
   total_chunks: 4 bytes   (unsigned)
   session_id  : 4 bytes   (unsigned, identifies one transfer)
   payload_len : 4 bytes   (unsigned)

@@ -26,13 +26,29 @@ CONTROL_PORT = 5001       # Heartbeat, switch signals, file control
 # ============================================================
 #  PROTOCOL TUNING
 # ============================================================
-CHUNK_SIZE = 60 * 1024          # 60 KB per chunk
-WINDOW_SIZE = 16                # Send up to 16 chunks before waiting for ACKs
+LIFI_CHUNK_SIZE = 60 * 1024     # 60 KB per LiFi data packet
+LIFI_WINDOW_SIZE = 16           # Send up to 16 LiFi packets before waiting for ACKs
+WIFI_CHUNK_SIZE = 10 * 1024     # 10 KB per WiFi data packet (ESP32 SoftAP friendly)
+WIFI_WINDOW_SIZE = 4            # Smaller WiFi window to avoid ESP32 AP buffer pressure
+
+# Backward-compatible defaults used by older tests/helpers.
+CHUNK_SIZE = LIFI_CHUNK_SIZE
+WINDOW_SIZE = LIFI_WINDOW_SIZE
 HEARTBEAT_INTERVAL = 0.1        # Send heartbeat every 100ms
 MAX_MISSED_HEARTBEATS = 3       # 3 missed = link dead (~300ms detection)
 ACK_TIMEOUT = 1.0               # Seconds to wait for ACK before retransmit
 MAX_RETRIES = 5                 # Max retransmits per chunk
 RECV_BUFFER = 65536             # UDP receive buffer size
+
+
+def chunk_size_for_interface(interface: str) -> int:
+    """Return the configured data packet size for an interface."""
+    return WIFI_CHUNK_SIZE if interface == "wifi" else LIFI_CHUNK_SIZE
+
+
+def window_size_for_interface(interface: str) -> int:
+    """Return the configured send window for an interface."""
+    return WIFI_WINDOW_SIZE if interface == "wifi" else LIFI_WINDOW_SIZE
 
 # ============================================================
 #  PATHS
@@ -51,7 +67,7 @@ DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 # ============================================================
 # Each HLS segment is a time-based slice of the video.
 # At 1080p ~5 Mbps, a 4-second segment ≈ 2.5 MB on disk.
-# The segment is then transferred over UDP in CHUNK_SIZE (60 KB) pieces.
+# The segment is then transferred over UDP using the active interface's packet size.
 
 HLS_SEGMENT_DURATION = 4        # seconds per HLS segment (must be integer)
 HLS_BUFFER_BEHIND = 7           # keep N segments behind current playback

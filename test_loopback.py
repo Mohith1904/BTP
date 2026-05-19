@@ -92,8 +92,47 @@ def test_chunking():
     os.remove(test_file)
     os.remove(reassembler.output_path)
 
+
+def test_byte_range_reassembly():
+    print("Test 4: Byte-range reassembly with mixed packet sizes...")
+    test_file = os.path.join(config.SHARED_FOLDER, "test_byte_range.bin")
+    test_data = os.urandom(180_000)
+    with open(test_file, "wb") as f:
+        f.write(test_data)
+
+    chunker = FileChunker(test_file, chunk_size=60 * 1024)
+    meta = chunker.metadata()
+    reassembler = ChunkReassembler(
+        filename="test_byte_range.bin",
+        file_size=meta["file_size"],
+        total_chunks=meta["total_chunks"],
+        chunk_size=meta["chunk_size"],
+        file_hash=meta["file_hash"],
+        output_dir=config.RECEIVE_FOLDER,
+        byte_range_mode=True,
+    )
+
+    ranges = [
+        (0, 60 * 1024),
+        (60 * 1024, 10 * 1024),
+        (70 * 1024, 10 * 1024),
+        (80 * 1024, 60 * 1024),
+        (140 * 1024, meta["file_size"] - 140 * 1024),
+    ]
+    for offset, length in reversed(ranges):
+        data = chunker.get_range(offset, length)
+        reassembler.add_range(offset, data)
+
+    assert reassembler.is_complete, "Byte-range transfer should be complete"
+    assert reassembler.verify(), "Byte-range hash should match"
+    print("  ✓ Mixed LiFi/WiFi-sized ranges reassembled and verified")
+
+    os.remove(test_file)
+    os.remove(reassembler.output_path)
+
+
 def test_json_payload():
-    print("Test 4: JSON payload encoding...")
+    print("Test 5: JSON payload encoding...")
     data = {"filename": "movie.mp4", "file_size": 1234567, "total_chunks": 21}
     payload = Packet.make_json_payload(data)
     p = Packet(PType.FILE_META, payload=payload)
@@ -105,7 +144,7 @@ def test_json_payload():
     print("  ✓ JSON payload roundtrip OK")
 
 def test_network_manager():
-    print("Test 5: NetworkManager socket creation...")
+    print("Test 6: NetworkManager socket creation...")
     from network.manager import NetworkManager
     nm = NetworkManager(
         my_lifi_ip="127.0.0.1",
@@ -129,6 +168,7 @@ if __name__ == "__main__":
     test_packet_roundtrip()
     test_packet_corruption()
     test_chunking()
+    test_byte_range_reassembly()
     test_json_payload()
     test_network_manager()
 

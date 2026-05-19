@@ -126,6 +126,10 @@ class Receiver:
                     seq_num=self._next_seq(),
                     chunk_id=pkt.chunk_id,
                     session_id=sid,
+                    payload=Packet.make_json_payload({
+                        "offset": pkt.chunk_id,
+                        "length": len(pkt.payload),
+                    }),
                 )
                 self.net.send_data(ack, interface=iface)
                 log.debug("Late DATA for completed session %d ignored", sid)
@@ -133,7 +137,15 @@ class Receiver:
             log.warning("DATA for unknown session %d", sid)
             return
 
-        is_new = reassembler.add_chunk(pkt.chunk_id, pkt.payload)
+        if reassembler.byte_range_mode:
+            is_new = reassembler.add_range(pkt.chunk_id, pkt.payload)
+            ack_payload = Packet.make_json_payload({
+                "offset": pkt.chunk_id,
+                "length": len(pkt.payload),
+            })
+        else:
+            is_new = reassembler.add_chunk(pkt.chunk_id, pkt.payload)
+            ack_payload = b""
 
         # Send ACK
         ack = Packet(
@@ -141,6 +153,7 @@ class Receiver:
             seq_num=self._next_seq(),
             chunk_id=pkt.chunk_id,
             session_id=sid,
+            payload=ack_payload,
         )
         self.net.send_data(ack, interface=iface)
 
@@ -198,6 +211,7 @@ class Receiver:
             chunk_size=meta["chunk_size"],
             file_hash=meta["file_hash"],
             output_dir=output_dir,
+            byte_range_mode=meta.get("transfer_mode") == "byte_range",
         )
         self.reassemblers[sid] = reassembler
 

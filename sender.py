@@ -12,6 +12,7 @@ import time
 import random
 import logging
 import threading
+from collections import deque
 
 import config
 from protocol.packet import Packet, PType
@@ -77,6 +78,28 @@ class Sender:
         self._seq += 1
         return self._seq
 
+    @staticmethod
+    def _add_range(ranges: list[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+        ranges.append((start, end))
+        ranges.sort()
+        merged: list[tuple[int, int]] = []
+        for s, e in ranges:
+            if not merged or s > merged[-1][1]:
+                merged.append((s, e))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        return merged
+
+    @staticmethod
+    def _range_covered(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+        if start >= end:
+            return True
+        return any(s <= start and e >= end for s, e in ranges)
+
+    @staticmethod
+    def _covered_bytes(ranges: list[tuple[int, int]]) -> int:
+        return sum(end - start for start, end in ranges)
+
     # ── handler registration ────────────────────────────────
     def _register_handlers(self):
         # Data port: receive ACKs
@@ -97,10 +120,20 @@ class Sender:
     # ── handlers ────────────────────────────────────────────
     def _on_ack(self, pkt: Packet, addr, iface):
         sid = pkt.session_id
-        cid = pkt.chunk_id
+        offset = pkt.chunk_id
+        length = 0
+        if pkt.payload:
+            try:
+                length = int(pkt.json_payload().get("length", 0))
+            except Exception:
+                length = 0
         with self._state_lock:
             if sid in self.acked_chunks:
-                self.acked_chunks[sid].add(cid)
+                ack_store = self.acked_chunks[sid]
+                if isinstance(ack_store, dict):
+                    ack_store[offset] = length
+                else:
+                    ack_store.add(offset)
 
     def _on_heartbeat_ack(self, pkt: Packet, addr, iface):
         self.last_hb_ack_time = time.time()
@@ -350,15 +383,18 @@ class Sender:
 
     # ── file transfer ───────────────────────────────────────
     def _send_file(self, filepath: str, session_id: int, stream_meta: dict | None = None):
-        chunker = FileChunker(filepath, config.CHUNK_SIZE)
+        initial_iface = self.net.active_interface
+        initial_chunk_size = config.chunk_size_for_interface(initial_iface)
+        chunker = FileChunker(filepath, initial_chunk_size)
         meta = chunker.metadata()
+        file_size = meta["file_size"]
         total = chunker.total_chunks
 
         with self._state_lock:
-            self.acked_chunks[session_id] = set()
+            self.acked_chunks[session_id] = {}
             self.active_transfers[session_id] = {
                 "filename": meta["filename"],
-            "total_chunks": total,
+                "total_chunks": total,
                 "started": time.time(),
             }
         self.stats["transfers"][session_id] = {
@@ -369,6 +405,12 @@ class Sender:
 
         # 1) Send FILE_META
         meta_for_payload = dict(meta)
+        meta_for_payload.update({
+            "transfer_mode": "byte_range",
+            "initial_interface": initial_iface,
+            "lifi_chunk_size": config.LIFI_CHUNK_SIZE,
+            "wifi_chunk_size": config.WIFI_CHUNK_SIZE,
+        })
         if stream_meta:
             meta_for_payload.update(stream_meta)
         meta_pkt = Packet(
@@ -383,74 +425,111 @@ class Sender:
         self.net.send_ctrl(meta_pkt, interface="wifi")
         time.sleep(0.05)
 
-        # 2) Windowed send
-        log.info("Sending %s (%d chunks, %d bytes)", meta["filename"], total, meta["file_size"])
-        next_chunk = 0
-        unacked: dict[int, float] = {}   # chunk_id -> last_send_time
-        retries: dict[int, int] = {}     # chunk_id -> retry_count
+        # 2) Windowed byte-range send. Packet size/window follow the active interface,
+        # so LiFi can use large packets while ESP32 WiFi stays below fragmentation pressure.
+        log.info(
+            "Sending %s (%d bytes, initial=%s, chunk=%d, window=%d)",
+            meta["filename"],
+            file_size,
+            initial_iface,
+            initial_chunk_size,
+            config.window_size_for_interface(initial_iface),
+        )
+        pending = deque([(0, file_size)])
+        unacked: dict[int, dict] = {}   # offset -> {length, last_send_time, retries}
+        retry_counts: dict[int, int] = {}
+        acked_ranges: list[tuple[int, int]] = []
 
         while True:
-            with self._state_lock:
-                if len(self.acked_chunks[session_id]) >= total:
-                    break
+            if self._range_covered(acked_ranges, 0, file_size):
+                break
             if not self.net.running:
                 return
 
             # Fill send window
-            while (len(unacked) < config.WINDOW_SIZE
-                   and next_chunk < total):
-                with self._state_lock:
-                    already_acked = next_chunk in self.acked_chunks[session_id]
-                if not already_acked:
-                    data = chunker.get_chunk(next_chunk)
-                    pkt = Packet(
-                        PType.DATA,
-                        seq_num=self._next_seq(),
-                        chunk_id=next_chunk,
-                        total_chunks=total,
-                        session_id=session_id,
-                        payload=data,
-                    )
-                    self.net.send_data(pkt)
-                    unacked[next_chunk] = time.time()
-                    retries.setdefault(next_chunk, 0)
-                    self.stats["bytes_sent"] += len(data)
-                    self.stats["chunks_sent"] += 1
-                next_chunk += 1
+            active_iface = self.net.active_interface
+            window_size = config.window_size_for_interface(active_iface)
+            packet_size = config.chunk_size_for_interface(active_iface)
+            while len(unacked) < window_size and pending:
+                offset, length = pending.popleft()
+                end = min(file_size, offset + length)
+                if self._range_covered(acked_ranges, offset, end):
+                    continue
 
-            # Process acked chunks
+                send_len = min(packet_size, end - offset)
+                tail_len = end - offset - send_len
+                if tail_len > 0:
+                    pending.appendleft((offset + send_len, tail_len))
+
+                data = chunker.get_range(offset, send_len)
+                if not data:
+                    continue
+
+                pkt = Packet(
+                    PType.DATA,
+                    seq_num=self._next_seq(),
+                    chunk_id=offset,
+                    total_chunks=total,
+                    session_id=session_id,
+                    payload=data,
+                )
+                self.net.send_data(pkt)
+                unacked[offset] = {
+                    "length": len(data),
+                    "last_send_time": time.time(),
+                    "retries": retry_counts.get(offset, 0),
+                }
+                self.stats["bytes_sent"] += len(data)
+                self.stats["chunks_sent"] += 1
+
+            # Process ACKed byte ranges
             with self._state_lock:
-                for cid in list(unacked):
-                    if cid in self.acked_chunks[session_id]:
-                        del unacked[cid]
+                ack_store = self.acked_chunks.get(session_id, {})
+                ack_items = list(ack_store.items()) if isinstance(ack_store, dict) else []
+                if isinstance(ack_store, dict):
+                    ack_store.clear()
 
-            # Retransmit timed-out chunks
+            for offset, length in ack_items:
+                if length <= 0:
+                    length = unacked.get(offset, {}).get("length", 0)
+                if length <= 0:
+                    continue
+                acked_ranges = self._add_range(acked_ranges, offset, offset + length)
+                unacked.pop(offset, None)
+                retry_counts.pop(offset, None)
+
+            for offset, info in list(unacked.items()):
+                if self._range_covered(acked_ranges, offset, offset + info["length"]):
+                    del unacked[offset]
+                    retry_counts.pop(offset, None)
+
+            # Retransmit timed-out ranges. If the interface changed to WiFi, the range is
+            # re-queued and split using the smaller WiFi packet size on the next send pass.
             now = time.time()
-            for cid, send_time in list(unacked.items()):
-                if now - send_time > config.ACK_TIMEOUT:
-                    retries[cid] = retries.get(cid, 0) + 1
-                    if retries[cid] > config.MAX_RETRIES:
-                        # Keep transfer alive by clamping retry attempts and continuing.
-                        # This avoids silently dropping a required chunk forever.
-                        log.warning("Chunk %d exceeded max retries; continuing retransmit", cid)
-                        retries[cid] = config.MAX_RETRIES
-                    data = chunker.get_chunk(cid)
-                    pkt = Packet(
-                        PType.DATA,
-                        seq_num=self._next_seq(),
-                        chunk_id=cid,
-                        total_chunks=total,
-                        session_id=session_id,
-                        payload=data,
+            for offset, info in list(unacked.items()):
+                if now - info["last_send_time"] > config.ACK_TIMEOUT:
+                    retry_counts[offset] = retry_counts.get(offset, info.get("retries", 0)) + 1
+                    if retry_counts[offset] > config.MAX_RETRIES:
+                        log.warning(
+                            "Range %d..%d exceeded max retries; continuing retransmit",
+                            offset,
+                            offset + info["length"],
+                        )
+                        retry_counts[offset] = config.MAX_RETRIES
+                    pending.appendleft((offset, info["length"]))
+                    del unacked[offset]
+                    log.debug(
+                        "Requeue range %d..%d (attempt %d)",
+                        offset,
+                        offset + info["length"],
+                        retry_counts[offset],
                     )
-                    self.net.send_data(pkt)
-                    unacked[cid] = now
-                    log.debug("Retransmit chunk %d (attempt %d)", cid, retries[cid])
 
             # Update stats
-            with self._state_lock:
-                acked_count = len(self.acked_chunks[session_id])
-            self.stats["transfers"][session_id]["progress"] = acked_count / total
+            acked_bytes = self._covered_bytes(acked_ranges)
+            self.stats["transfers"][session_id]["progress"] = (
+                1.0 if file_size == 0 else min(1.0, acked_bytes / file_size)
+            )
             self.stats["transfers"][session_id]["interface"] = self.net.active_interface
 
             time.sleep(0.001)  # yield
